@@ -451,7 +451,7 @@ def make_parser():
     p.add_argument("--warmup-frac", type=float, default=0.0)
     p.add_argument("--decay-frac", type=float, default=0.285)
 
-    p.add_argument("--optimizer", choices=["scion", "scionc"], default="scionc")
+    p.add_argument("--optimizer", choices=["scion", "scionc"], default="scion")
     p.add_argument("--lr", type=float, default=1e-2)
     p.add_argument("--lr-embed", dest="lr_embed", type=float, default=None)
     p.add_argument("--lr-hidden", dest="lr_hidden", type=float, default=None)
