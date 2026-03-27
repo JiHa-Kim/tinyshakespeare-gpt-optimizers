@@ -25,7 +25,7 @@ def rms_norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 
 
 def rms_ball_proj(x: torch.Tensor) -> torch.Tensor:
-    return x / (x.square().mean(dim=-1, keepdim=True)).sqrt().clamp_min(1.0)
+    return x * torch.rsqrt(x.square().mean(dim=-1, keepdim=True).clamp_min_(1.0))
 
 
 class Norm(nn.Module):
@@ -50,6 +50,8 @@ def rotary_cache(seq_len: int, head_dim: int, base: float = 10000.0):
 
 
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    cos = cos.to(dtype=x.dtype)
+    sin = sin.to(dtype=x.dtype)
     x1, x2 = x[..., ::2], x[..., 1::2]
     return torch.stack((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1).flatten(-2)
 

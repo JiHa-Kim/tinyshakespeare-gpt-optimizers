@@ -5,9 +5,9 @@ This repo is organized around one goal: tune the peak learning rate for **vanill
 Files:
 
 - `lionk_ccwd.py`: Lion-K core with optional corrected decoupled decay
-- `scion.py`: Scion LMOs, geometry-matched initialization helpers, and LR transfer helper
-- `gpt.py` + `train_shakespeare.py`: a small GPT training loop for tiny Shakespeare
-- `tune_lr.py`: a branch-aware LR tuner for WSD / stable-decay
+- `scion.py`: Scion LMOs, geometry-matched initialization helpers, LR transfer helper, and workspace reuse in the spectral LMO
+- `gpt.py` + `train_shakespeare.py`: a small GPT training loop for tiny Shakespeare, with val-only evals during training and best-or-final checkpointing
+- `tune_lr.py`: a branch-aware LR tuner for WSD / stable-decay, with cached batch sources and reusable tail runners
 
 ## Main policy
 

@@ -11,7 +11,7 @@ from scion import scion_transfer_lr
 from train_shakespeare import (
     amp_ctx,
     build_optimizer,
-    estimate_loss,
+    estimate_val_loss,
     init_gpt_scion_,
     make_parser,
     sync_now,
@@ -114,19 +114,24 @@ def score_with_tolerance(best_score: float, cand_score: float, rel_tol: float) -
 
 
 
-def clone_state_dict_cpu(state_dict):
+def clone_state_dict(state_dict, device: torch.device | None = None):
     out = {}
     for k, v in state_dict.items():
         if torch.is_tensor(v):
-            out[k] = v.detach().cpu().clone()
+            dst = v.device if device is None else device
+            out[k] = v.detach().to(dst).clone()
         elif isinstance(v, dict):
-            out[k] = clone_state_dict_cpu(v)
+            out[k] = clone_state_dict(v, device=device)
         elif isinstance(v, list):
-            out[k] = [clone_state_dict_cpu(x) if isinstance(x, dict) else (x.detach().cpu().clone() if torch.is_tensor(x) else x) for x in v]
+            out[k] = [
+                clone_state_dict(x, device=device)
+                if isinstance(x, dict)
+                else (x.detach().to(x.device if device is None else device).clone() if torch.is_tensor(x) else copy.deepcopy(x))
+                for x in v
+            ]
         else:
             out[k] = copy.deepcopy(v)
     return out
-
 
 
 def optimizer_to_device(opt: torch.optim.Optimizer, device: torch.device):
@@ -142,6 +147,20 @@ def set_seed(seed: int):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
+
+
+
+
+_SOURCE_CACHE = {}
+
+
+def get_batch_source(dataset, args, device):
+    key = (id(dataset.train), id(dataset.val), args.block_size, args.batch_size, str(device))
+    source = _SOURCE_CACHE.get(key)
+    if source is None:
+        source = BatchSource(dataset.train, dataset.val, args.block_size, args.batch_size, device)
+        _SOURCE_CACHE[key] = source
+    return source
 
 
 def prepare_runtime(base_args):
@@ -172,8 +191,9 @@ def build_run_objects(args, dataset, device):
         )
     ).to(device)
     init_gpt_scion_(raw_model, args)
-    source = BatchSource(dataset.train, dataset.val, args.block_size, args.batch_size, device)
+    source = get_batch_source(dataset, args, device)
     opt = build_optimizer(raw_model, args, device)
+    opt._cpu_snapshots = getattr(args, 'cpu_snapshots', False)
     return raw_model, raw_model, opt, source
 
 
@@ -231,10 +251,10 @@ def run_loop(
             group['lr'] = lr
 
         if step % eval_interval == 0 or step == steps - 1:
-            losses = estimate_loss(model, source, eval_iters, amp_dtype)
-            train_loss, val_loss = losses['train'], losses['val']
-            last_losses = losses
-            if not (math.isfinite(train_loss) and math.isfinite(val_loss)):
+            train_loss = last_losses['train']
+            val_loss = estimate_val_loss(model, source, eval_iters, amp_dtype)
+            last_losses['val'] = val_loss
+            if not math.isfinite(val_loss):
                 diverged, diverge_reason = True, 'nonfinite_eval_loss'
             else:
                 if initial_val is None:
@@ -263,17 +283,21 @@ def run_loop(
                 break
 
         opt.zero_grad(set_to_none=True)
+        train_loss = 0.0
         for _ in range(grad_accum):
             with amp_ctx(amp_dtype):
                 _, loss = model(*source.get('train'))
                 loss = loss / grad_accum
-            if not torch.isfinite(loss.detach()):
+            loss_value = float(loss.detach())
+            if not math.isfinite(loss_value):
                 diverged, diverge_reason = True, 'nonfinite_train_loss'
                 break
+            train_loss += loss_value
             loss.backward()
         if diverged:
             print(f'diverged {diverge_reason}')
             break
+        last_losses['train'] = train_loss
 
         if grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(raw_model.parameters(), grad_clip)
@@ -282,9 +306,10 @@ def run_loop(
 
         completed_steps = step + 1
         if completed_steps in snapshot_steps:
+            snapshot_device = torch.device('cpu') if getattr(opt, '_cpu_snapshots', False) else None
             snapshots[completed_steps] = {
-                'model': clone_state_dict_cpu(raw_model.state_dict()),
-                'opt': clone_state_dict_cpu(opt.state_dict()),
+                'model': clone_state_dict(raw_model.state_dict(), device=snapshot_device),
+                'opt': clone_state_dict(opt.state_dict(), device=snapshot_device),
                 'completed_steps': completed_steps,
             }
 
@@ -505,14 +530,16 @@ def run_branch_family(exp2_lr, branch_args, dataset, device, amp_dtype, seed, de
             )
         return rows
 
+    tail_args = copy.deepcopy(branch_args)
+    tail_args.lr = lr
+    raw_tail, tail_model, tail_opt, tail_source = build_run_objects(tail_args, dataset, device)
+
     for df in decay_fracs:
         snap = trunk_metrics['snapshots'][branch_start_steps[df]]
-        tail_args = copy.deepcopy(branch_args)
-        tail_args.lr = lr
-        raw_tail, tail_model, tail_opt, tail_source = build_run_objects(tail_args, dataset, device)
         raw_tail.load_state_dict(snap['model'])
         tail_opt.load_state_dict(snap['opt'])
-        optimizer_to_device(tail_opt, device)
+        if getattr(tail_opt, '_cpu_snapshots', False):
+            optimizer_to_device(tail_opt, device)
         print(
             f'=== branch tail | {tail_args.prenorm} | seed {seed} | 2**{exp2_lr:.2f} = {lr:.3e} | '
             f'decay_frac {df:.3f} | start_step {branch_start_steps[df]} ==='
@@ -795,6 +822,7 @@ def main():
     p.add_argument('--alpha-transfer', type=float, default=0.5)
     p.add_argument('--prenorm', choices=['rmsnorm', 'rmsball', 'both'], default='both')
     p.add_argument('--compile-tuning', action='store_true')
+    p.add_argument('--cpu-snapshots', action='store_true', help='store branch snapshots on CPU instead of the active device')
     args, rest = p.parse_known_args()
 
     target_cfg = make_parser().parse_args(rest)

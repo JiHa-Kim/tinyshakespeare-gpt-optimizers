@@ -67,12 +67,18 @@ def lr_at_step(
 
 
 @torch.inference_mode()
-def estimate_loss(model: GPT, source: BatchSource, eval_iters: int, amp_dtype: torch.dtype | None):
+def estimate_loss(
+    model: GPT,
+    source: BatchSource,
+    eval_iters: int,
+    amp_dtype: torch.dtype | None,
+    splits=('train', 'val'),
+):
     was_training = model.training
     model.eval()
     out = {}
     with amp_ctx(amp_dtype):
-        for split in ('train', 'val'):
+        for split in splits:
             total = 0.0
             for _ in range(eval_iters):
                 _, loss = model(*source.get(split))
@@ -80,6 +86,11 @@ def estimate_loss(model: GPT, source: BatchSource, eval_iters: int, amp_dtype: t
             out[split] = total / eval_iters
     model.train(was_training)
     return out
+
+
+@torch.inference_mode()
+def estimate_val_loss(model: GPT, source: BatchSource, eval_iters: int, amp_dtype: torch.dtype | None) -> float:
+    return estimate_loss(model, source, eval_iters, amp_dtype, splits=('val',))['val']
 
 
 @torch.no_grad()
@@ -241,13 +252,14 @@ def train(args):
             group['lr'] = lr
 
         if step % args.eval_interval == 0 or step == args.max_iters - 1:
-            losses = estimate_loss(model, source, args.eval_iters, amp_dtype)
-            train_loss, val_loss = losses['train'], losses['val']
-            last_losses = losses
+            train_loss = last_losses['train']
+            val_loss = estimate_val_loss(model, source, args.eval_iters, amp_dtype)
+            last_losses['val'] = val_loss
 
-            if not (math.isfinite(train_loss) and math.isfinite(val_loss)):
+            if not math.isfinite(val_loss):
                 diverged, diverge_reason = True, 'nonfinite_eval_loss'
             else:
+                prev_best = best_val
                 if initial_val is None:
                     initial_val = val_loss
                 best_val = min(best_val, val_loss)
@@ -255,30 +267,34 @@ def train(args):
                 if step > 0 and val_loss > initial_val * args.diverge_mult:
                     diverged = True
                     diverge_reason = f'val_loss_exceeded_{args.diverge_mult:.2f}x_initial'
+                if not args.no_save and (val_loss < prev_best or step == args.max_iters - 1):
+                    save_checkpoint(Path(args.out_path), raw_model, dataset, args)
 
             elapsed = max(sync_now(device) - train_start, 1e-9)
             print(
                 f'step {step:5d} | lr {lr:.3e} | train {train_loss:.4f} | val {val_loss:.4f} | '
                 f'best_val {best_val:.4f} | train_seconds {elapsed:.3f} | tok/s {(total_opt_steps * effective_tokens) / elapsed:.0f}'
             )
-            if not args.no_save:
-                save_checkpoint(Path(args.out_path), raw_model, dataset, args)
             if diverged:
                 print(f'diverged {diverge_reason}')
                 break
 
         opt.zero_grad(set_to_none=True)
+        train_loss = 0.0
         for _ in range(args.grad_accum):
             with amp_ctx(amp_dtype):
                 _, loss = model(*source.get('train'))
                 loss = loss / args.grad_accum
-            if not torch.isfinite(loss.detach()):
+            loss_value = float(loss.detach())
+            if not math.isfinite(loss_value):
                 diverged, diverge_reason = True, 'nonfinite_train_loss'
                 break
+            train_loss += loss_value
             loss.backward()
         if diverged:
             print(f'diverged {diverge_reason}')
             break
+        last_losses['train'] = train_loss
 
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(raw_model.parameters(), args.grad_clip)

@@ -36,6 +36,7 @@ def polar_express_uvt(
     steps: int = 5,
     eps: float = 1e-7,
     work_dtype: torch.dtype | None = None,
+    workspace: dict | None = None,
 ) -> torch.Tensor:
     if g.ndim != 2:
         raise ValueError('polar_express_uvt expects a 2D tensor')
@@ -47,13 +48,33 @@ def polar_express_uvt(
     if transposed:
         x = x.mT
 
-    x = x / (torch.linalg.matrix_norm(x, ord='fro') * 1.01 + eps)
+    x = x / (torch.linalg.vector_norm(x) * 1.01 + eps)
     n = len(_PE)
+    buffers = None if workspace is None else workspace.setdefault((tuple(x.shape), x.dtype, x.device), {})
+    if buffers is not None:
+        rows, cols = x.shape
+        gram_shape = (rows, rows)
+        if buffers.get('A') is None or tuple(buffers['A'].shape) != gram_shape:
+            buffers['A'] = torch.empty(gram_shape, dtype=x.dtype, device=x.device)
+        if buffers.get('AX') is None or tuple(buffers['AX'].shape) != (rows, cols):
+            buffers['AX'] = torch.empty((rows, cols), dtype=x.dtype, device=x.device)
+        if buffers.get('AAX') is None or tuple(buffers['AAX'].shape) != (rows, cols):
+            buffers['AAX'] = torch.empty((rows, cols), dtype=x.dtype, device=x.device)
+
     for i in range(steps):
         a, b, c = _PE[i if i < n else n - 1]
-        A = x @ x.mT
-        AX = A @ x
-        x.mul_(a).add_(AX, alpha=b).add_(A @ AX, alpha=c)
+        if buffers is None:
+            A = x @ x.mT
+            AX = A @ x
+            AAX = A @ AX
+        else:
+            A = buffers['A']
+            AX = buffers['AX']
+            AAX = buffers['AAX']
+            torch.mm(x, x.mT, out=A)
+            torch.mm(A, x, out=AX)
+            torch.mm(A, AX, out=AAX)
+        x.mul_(a).add_(AX, alpha=b).add_(AAX, alpha=c)
 
     return (x.mT if transposed else x).to(g.dtype)
 
@@ -91,7 +112,7 @@ class RowNormLMO:
 
 
 class SpectralLMO:
-    __slots__ = ('radius', 'steps', 'eps', 'work_dtype', 'input_like')
+    __slots__ = ('radius', 'steps', 'eps', 'work_dtype', 'input_like', 'workspace')
 
     def __init__(
         self,
@@ -106,12 +127,13 @@ class SpectralLMO:
         self.eps = eps
         self.work_dtype = work_dtype
         self.input_like = input_like
+        self.workspace = {}
 
     def __call__(self, v: torch.Tensor) -> torch.Tensor:
         scale = math.sqrt(v.size(0) / v.size(1))
         if self.input_like:
             scale = max(1.0, scale)
-        return polar_express_uvt(v, self.steps, self.eps, self.work_dtype).mul_(-self.radius * scale)
+        return polar_express_uvt(v, self.steps, self.eps, self.work_dtype, self.workspace).mul_(-self.radius * scale)
 
 
 @torch.no_grad()
