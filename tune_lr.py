@@ -201,7 +201,7 @@ def main():
     p.add_argument("--exp2-max", type=float, default=-8.0)
     p.add_argument("--coarse-step", type=float, default=1.0)
     p.add_argument("--fine-step", type=float, default=0.25)
-    p.add_argument("--fine-radius", type=float, default=1.0)
+    p.add_argument("--fine-radius", type=float, default=0.0)
     p.add_argument("--csv-path", default="out/lr_sweep.csv")
     p.add_argument("--keep-checkpoints", action="store_true")
     p.add_argument("--no-proxy", action="store_true")
