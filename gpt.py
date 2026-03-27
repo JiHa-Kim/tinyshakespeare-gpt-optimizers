@@ -24,8 +24,8 @@ def rms_norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return x * torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + eps)
 
 
-def rms_ball_proj(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
-    return x / (x.square().mean(dim=-1, keepdim=True) + eps).sqrt().clamp_min(1.0)
+def rms_ball_proj(x: torch.Tensor) -> torch.Tensor:
+    return x / (x.square().mean(dim=-1, keepdim=True)).sqrt().clamp_min(1.0)
 
 
 class Norm(nn.Module):
@@ -37,7 +37,7 @@ class Norm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return rms_norm(x, self.eps) if self.kind == "rmsnorm" else rms_ball_proj(x, self.eps)
+        return rms_norm(x, self.eps) if self.kind == "rmsnorm" else rms_ball_proj(x)
 
 
 def rotary_cache(seq_len: int, head_dim: int, base: float = 10000.0):
@@ -55,7 +55,9 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, d_model: int, n_head: int, block_size: int, rope_base: float = 10000.0):
+    def __init__(
+        self, d_model: int, n_head: int, block_size: int, rope_base: float = 10000.0
+    ):
         super().__init__()
         if d_model % n_head:
             raise ValueError("d_model must be divisible by n_head")
@@ -156,7 +158,11 @@ class GPT(nn.Module):
         for block in self.blocks:
             x = block(x)
         logits = self.lm_head(self.norm_f(x))
-        loss = None if targets is None else F.cross_entropy(logits.flatten(0, 1), targets.flatten())
+        loss = (
+            None
+            if targets is None
+            else F.cross_entropy(logits.flatten(0, 1), targets.flatten())
+        )
         return logits, loss
 
     @torch.inference_mode()
@@ -177,7 +183,9 @@ class GPT(nn.Module):
             if top_k > 0:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits = logits.masked_fill(logits < v[:, [-1]], float("-inf"))
-            idx = torch.cat((idx, torch.multinomial(F.softmax(logits, dim=-1), 1)), dim=1)
+            idx = torch.cat(
+                (idx, torch.multinomial(F.softmax(logits, dim=-1), 1)), dim=1
+            )
         self.train(was_training)
         return idx
 
@@ -218,7 +226,9 @@ class BatchSource:
 
     def get(self, split: str):
         data = self.train if split == "train" else self.val
-        ix = torch.randint(0, data.numel() - self.block_size, (self.batch_size, 1), device=self.device)
+        ix = torch.randint(
+            0, data.numel() - self.block_size, (self.batch_size, 1), device=self.device
+        )
         chunk = data[ix + self.offsets]
         return chunk[:, :-1], chunk[:, 1:]
 
