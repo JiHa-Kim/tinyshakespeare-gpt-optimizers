@@ -118,6 +118,16 @@ def init_gpt_scion_(model: GPT, args):
     init_rownorm_(model.lm_head.weight, radius=args.rho_out)
 
 
+def resolve_group_lr(args, group: str) -> tuple[float, float]:
+    peak = getattr(args, f"lr_{group}", None)
+    if peak is None:
+        peak = args.lr
+    min_lr = getattr(args, f"min_lr_{group}", None)
+    if min_lr is None:
+        min_lr = args.min_lr
+    return peak, min_lr
+
+
 @torch.no_grad()
 def build_optimizer(model: GPT, args, device: torch.device):
     work_dtype = torch.bfloat16 if device.type == "cuda" else None
@@ -136,30 +146,41 @@ def build_optimizer(model: GPT, args, device: torch.device):
     hidden = [p for p in model.parameters() if p.requires_grad and id(p) not in skip]
     groups = []
 
-    def add(params, dir_fn, theta2=None):
+    def add(name, params, dir_fn, theta2=None):
         if not params:
             return
-        group = {"params": params, "dir_fn": dir_fn}
+        peak_lr, min_lr = resolve_group_lr(args, name)
+        group = {
+            "name": name,
+            "params": params,
+            "dir_fn": dir_fn,
+            "lr": peak_lr,
+            "peak_lr": peak_lr,
+            "min_lr": min_lr,
+        }
         if args.optimizer == "scionc" and theta2 is not None:
             group["theta2"] = theta2
         groups.append(group)
 
     add(
+        "embed",
         [model.tok_emb.weight],
         ColNormLMO(args.rho_embed, transpose=True),
         args.theta2_embed,
     )
     add(
+        "hidden",
         hidden,
         SpectralLMO(args.rho_hidden, args.pe_steps, work_dtype=work_dtype),
         args.theta2_hidden,
     )
-    add([model.lm_head.weight], RowNormLMO(args.rho_out), args.theta2_out)
+    add("out", [model.lm_head.weight], RowNormLMO(args.rho_out), args.theta2_out)
 
+    default_lr, _ = resolve_group_lr(args, "hidden")
     opt_cls = Scion if args.optimizer == "scion" else ScionC
     return opt_cls(
         groups,
-        lr=args.lr,
+        lr=default_lr,
         beta2=args.beta2,
         phi=args.phi,
         eta=args.eta,
@@ -266,10 +287,17 @@ def train(args):
     )
     effective_tokens = args.batch_size * args.block_size * args.grad_accum
 
+    group_schedule = []
+    for group in opt.param_groups:
+        name = group.get("name", "group")
+        peak_lr = group.get("peak_lr", group["lr"])
+        min_lr = group.get("min_lr", args.min_lr)
+        group_schedule.append(f"{name}=({peak_lr:.3e}->{min_lr:.3e})")
     print(
         "schedule "
         f"warmup_steps={warmup_steps} stable_steps={stable_steps} decay_steps={decay_steps} "
-        f"lr={args.lr:.3e} min_lr={args.min_lr:.3e} optimizer={args.optimizer} prenorm={args.prenorm}"
+        f"optimizer={args.optimizer} prenorm={args.prenorm} lr_groups="
+        + ", ".join(group_schedule)
     )
 
     total_opt_steps = 0
@@ -282,11 +310,16 @@ def train(args):
     train_start = sync_now(device)
 
     for step in range(args.max_iters):
-        lr = lr_at_step(
-            step, args.max_iters, args.lr, args.min_lr, warmup_steps, decay_steps
-        )
+        current_lrs = {}
         for group in opt.param_groups:
-            group["lr"] = lr
+            peak_lr = group.get("peak_lr", args.lr)
+            min_lr = group.get("min_lr", args.min_lr)
+            group_lr = lr_at_step(
+                step, args.max_iters, peak_lr, min_lr, warmup_steps, decay_steps
+            )
+            group["lr"] = group_lr
+            current_lrs[group.get("name", f"group{len(current_lrs)}")] = group_lr
+        lr = current_lrs.get("hidden", next(iter(current_lrs.values())))
 
         if step % args.eval_interval == 0 or step == args.max_iters - 1:
             train_loss = last_losses["train"]
@@ -420,7 +453,15 @@ def make_parser():
 
     p.add_argument("--optimizer", choices=["scion", "scionc"], default="scion")
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--lr-embed", dest="lr_embed", type=float, default=None)
+    p.add_argument("--lr-hidden", dest="lr_hidden", type=float, default=None)
+    p.add_argument("--lr-out", "--lr-unembed", dest="lr_out", type=float, default=None)
     p.add_argument("--min-lr", type=float, default=0.0)
+    p.add_argument("--min-lr-embed", dest="min_lr_embed", type=float, default=None)
+    p.add_argument("--min-lr-hidden", dest="min_lr_hidden", type=float, default=None)
+    p.add_argument(
+        "--min-lr-out", "--min-lr-unembed", dest="min_lr_out", type=float, default=None
+    )
     p.add_argument("--beta2", type=float, default=0.95)
     p.add_argument("--phi", type=float, default=0.0)
     p.add_argument("--eta", type=float, default=None)
@@ -430,9 +471,9 @@ def make_parser():
     p.add_argument("--theta2-hidden", type=float, default=None)
     p.add_argument("--theta2-out", type=float, default=None)
     p.add_argument("--pe-steps", type=int, default=5)
-    p.add_argument("--rho-embed", type=float, default=1.0)
-    p.add_argument("--rho-hidden", type=float, default=3.0)
-    p.add_argument("--rho-out", type=float, default=10.0)
+    p.add_argument("--rho-embed", type=float, default=8.0)
+    p.add_argument("--rho-hidden", type=float, default=8.0)
+    p.add_argument("--rho-out", type=float, default=8.0)
 
     p.add_argument("--prompt", default="To be, or not to be")
     p.add_argument("--sample-tokens", type=int, default=400)

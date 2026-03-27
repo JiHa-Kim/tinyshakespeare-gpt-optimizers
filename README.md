@@ -199,7 +199,7 @@ python tune_lr.py \
 
 - The tuner assumes warmup is zero during LR tuning unless you override it.
 - If the top screen candidate stays stable and keeps improving, the screen range expands automatically.
-- The trainer uses one global LR, so the practical transfer recommendation is still the **transferred hidden LR**.
+- The trainer now supports `--lr-embed`, `--lr-hidden`, and `--lr-out`, so the tuner can emit actionable per-group transfer recommendations for the target run.
 
 
 ## Adaptive WSD LR tuner
