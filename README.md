@@ -3,7 +3,7 @@
 A tiny reference implementation with four pieces:
 
 - `lionk_ccwd.py`: general Lion-K with corrected cautious weight decay and primal averaging
-- `scionc.py`: ScionC specialization, LMOs, init helpers, and simple transfer helper
+- `scion.py`: Scion specialization, LMOs, init helpers, and transfer helper
 - `gpt.py` + `train_shakespeare.py`: modern minimal GPT for tiny Shakespeare
 - `tune_lr.py`: minimal LR sweep script
 
@@ -18,13 +18,13 @@ Model choices:
 - output head always uses row norm
 - ScionC defaults to primal averaging OFF (`phi = 0.0`)
 - ScionC defaults to no gradient clipping (`--grad-clip 0.0`)
-- Warmup-stable-decay learning rate schedule
 
 ## Tuning policy
 
-Tune a single global learning rate first:
+Tune a single global learning rate first, but tune it **separately** for:
 
-- `--lr`
+- `--prenorm rmsnorm`
+- `--prenorm rmsball`
 
 Keep the Scion radii fixed:
 
@@ -35,7 +35,6 @@ Keep the rest fixed while tuning LR:
 
 - `--phi 0.0`
 - `--grad-clip 0.0`
-- `--prenorm rmsnorm`
 
 ## WSD schedule
 
@@ -81,17 +80,37 @@ Default proxy settings:
 
 ## LR strategy with WSD
 
-Use this order:
+The sweep is two-stage in base-2 space:
 
-1. Sweep `log2(lr)` on the proxy model with WSD.
-2. Pick the best LR by best validation loss.
-3. Recheck the top 1 to 3 LR values on the full model.
-4. Only if the first 20 to 50 optimizer steps are obviously unstable, add a tiny warmup such as `--warmup-frac 0.01`.
-
-The default sweep is two-stage in `log2(lr)`:
-
-1. coarse sweep over integer-ish exponents
+1. coarse sweep over `log2(lr)`
 2. fine sweep around the best coarse exponent
+
+Selection rule:
+
+- choose the **largest LR that stays stable**
+- stability means no non-finite train/eval losses and no evaluation loss blow-up beyond `--diverge-mult x initial_val`
+- only if no candidate is stable, fall back to best validation loss among finite runs
+
+This is more aggressive than choosing pure best validation loss, which tends to bias conservative on short proxy WSD runs.
+
+## Automatic proxy-to-target LR transfer
+
+`tune_lr.py` automatically computes Scion transfer from the proxy run to the target run.
+
+The transfer uses:
+
+- token multiplier `mT`
+- layer multiplier `mL`
+- transfer exponent `alpha` (default `0.5`)
+
+It prints:
+
+- proxy LR selected by the sweep
+- transferred target embed LR
+- transferred target hidden LR
+- transferred target output LR
+
+Because the current train script uses one global LR, the practical recommendation is to start from the transferred hidden LR.
 
 ## Install
 
@@ -147,6 +166,13 @@ python tune_lr.py \
   --compile
 ```
 
+This runs both:
+
+- `prenorm = rmsnorm`
+- `prenorm = rmsball`
+
+and prints separate recommendations for each.
+
 To disable the proxy and sweep the full model directly:
 
 ```bash
@@ -161,6 +187,13 @@ When `--compile` is enabled, the script logs:
 - `train_seconds`: elapsed training time excluding compile
 - `tok/s`: throughput excluding compile
 
+The training loop also returns divergence information used by `tune_lr.py`:
+
+- `diverged`
+- `diverge_reason`
+- `initial_val`
+- `max_val`
+
 ## Sample
 
 ```bash
@@ -174,12 +207,12 @@ python train_shakespeare.py --mode sample --out-path out/scionc_shakespeare.pt -
 - `LionKCCWDPA`: general optimizer core
 - `corrected_eta(...)`: corrected multiplicative decay helper
 
-### `scionc.py`
+### `scion.py`
 
 - LMOs with explicit radii: `ColNormLMO`, `SpectralLMO`, `RowNormLMO`, `RMSLMO`
 - init helpers: `init_colnorm_`, `init_rownorm_`, `init_semiorthogonal_`
 - transfer helper: `scion_transfer_lr(...)`
-- optimizer specialization: `ScionC`
+- optimizer specialization: `Scion`
 
 ### `gpt.py`
 

@@ -1,4 +1,5 @@
 import argparse
+import math
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -39,7 +40,6 @@ def lr_at_step(
 ) -> float:
     if warmup_steps > 0 and step < warmup_steps:
         return lr * (step + 1) / warmup_steps
-
     decay_steps = min(max(decay_steps, 1), max_steps)
     stable_end = max_steps - decay_steps
     if step < stable_end:
@@ -214,6 +214,10 @@ def train(args):
     total_opt_steps = 0
     best_val = float("inf")
     last_losses = {"train": float("nan"), "val": float("nan")}
+    initial_val = None
+    max_val = float("-inf")
+    diverged = False
+    diverge_reason = ""
 
     warmup_steps = (
         args.warmup_iters
@@ -232,15 +236,37 @@ def train(args):
         if step % args.eval_interval == 0 or step == args.max_iters - 1:
             losses = estimate_loss(model, source, args.eval_iters, amp_dtype)
             last_losses = losses
-            best_val = min(best_val, losses["val"])
+            train_loss = losses["train"]
+            val_loss = losses["val"]
+            if not (math.isfinite(train_loss) and math.isfinite(val_loss)):
+                diverged = True
+                diverge_reason = "nonfinite_eval_loss"
+            else:
+                if initial_val is None:
+                    initial_val = val_loss
+                max_val = max(max_val, val_loss)
+                best_val = min(best_val, val_loss)
+                if (
+                    step > 0
+                    and initial_val is not None
+                    and val_loss > initial_val * args.diverge_mult
+                ):
+                    diverged = True
+                    diverge_reason = (
+                        f"val_loss_exceeded_{args.diverge_mult:.2f}x_initial"
+                    )
             train_elapsed = max(sync_now(device) - train_start, 1e-9)
             tok_per_s = (total_opt_steps * effective_tokens) / train_elapsed
             print(
                 f"step {step:5d} | lr {lr:.3e} | "
-                f"train {losses['train']:.4f} | val {losses['val']:.4f} | best_val {best_val:.4f} | "
+                f"train {train_loss:.4f} | val {val_loss:.4f} | best_val {best_val:.4f} | "
                 f"train_seconds {train_elapsed:.3f} | tok/s {tok_per_s:.0f}"
             )
-            save_checkpoint(Path(args.out_path), raw_model, dataset, args)
+            if not args.no_save:
+                save_checkpoint(Path(args.out_path), raw_model, dataset, args)
+            if diverged:
+                print(f"diverged {diverge_reason}")
+                break
 
         opt.zero_grad(set_to_none=True)
         for _ in range(args.grad_accum):
@@ -253,27 +279,39 @@ def train(args):
             with ctx:
                 _, loss = model(xb, yb)
                 loss = loss / args.grad_accum
+            if not torch.isfinite(loss.detach()):
+                diverged = True
+                diverge_reason = "nonfinite_train_loss"
+                break
             loss.backward()
+        if diverged:
+            print(f"diverged {diverge_reason}")
+            break
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(raw_model.parameters(), args.grad_clip)
         opt.step()
         total_opt_steps += 1
 
-    prompt = args.prompt or "\n"
-    x = torch.tensor([dataset.encode(prompt)], dtype=torch.long, device=device)
-    y = raw_model.generate(
-        x,
-        max_new_tokens=args.sample_tokens,
-        temperature=args.temperature,
-        top_k=args.top_k,
-    )
-    print("\n--- sample ---\n")
-    print(dataset.decode(y[0].tolist()))
+    if not args.skip_sample and not diverged:
+        prompt = args.prompt or "\n"
+        x = torch.tensor([dataset.encode(prompt)], dtype=torch.long, device=device)
+        y = raw_model.generate(
+            x,
+            max_new_tokens=args.sample_tokens,
+            temperature=args.temperature,
+            top_k=args.top_k,
+        )
+        print("\n--- sample ---\n")
+        print(dataset.decode(y[0].tolist()))
     return {
         "best_val": best_val,
         "final_train": last_losses["train"],
         "final_val": last_losses["val"],
         "compile_seconds": compile_seconds,
+        "initial_val": initial_val if initial_val is not None else float("nan"),
+        "max_val": max_val,
+        "diverged": diverged,
+        "diverge_reason": diverge_reason,
     }
 
 
@@ -319,6 +357,7 @@ def make_parser():
     p.add_argument("--eval-interval", type=int, default=200)
     p.add_argument("--eval-iters", type=int, default=50)
     p.add_argument("--grad-clip", type=float, default=0.0)
+    p.add_argument("--diverge-mult", type=float, default=2.0)
 
     p.add_argument(
         "--warmup-iters", type=int, default=-1, help="if >=0, overrides warmup-frac"
@@ -340,6 +379,8 @@ def make_parser():
     p.add_argument("--sample-tokens", type=int, default=400)
     p.add_argument("--temperature", type=float, default=0.9)
     p.add_argument("--top-k", type=int, default=40)
+    p.add_argument("--skip-sample", action="store_true")
+    p.add_argument("--no-save", action="store_true")
     return p
 
 
