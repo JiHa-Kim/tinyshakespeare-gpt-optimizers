@@ -14,6 +14,7 @@ from gpt import (
     maybe_download_tiny_shakespeare,
 )
 from scion import (
+    Scion,
     ScionC,
     SpectralLMO,
     ColNormLMO,
@@ -85,7 +86,7 @@ def init_gpt_scion_(model: GPT):
 
 
 @torch.no_grad()
-def build_scionc(model: GPT, args, device: torch.device) -> ScionC:
+def build_optimizer(model: GPT, args, device: torch.device):
     work_dtype = torch.bfloat16 if device.type == "cuda" else None
     lmo_embed = ColNormLMO(radius=args.rho_embed)
     lmo_hidden = SpectralLMO(
@@ -106,15 +107,33 @@ def build_scionc(model: GPT, args, device: torch.device) -> ScionC:
 
     groups = []
     if embed:
-        groups.append({"params": embed, "dir_fn": lmo_embed})
+        group = {"params": embed, "dir_fn": lmo_embed}
+        if args.optimizer == "scionc" and args.theta2_embed is not None:
+            group["theta2"] = args.theta2_embed
+        groups.append(group)
     if hidden:
-        groups.append({"params": hidden, "dir_fn": lmo_hidden})
+        group = {"params": hidden, "dir_fn": lmo_hidden}
+        if args.optimizer == "scionc" and args.theta2_hidden is not None:
+            group["theta2"] = args.theta2_hidden
+        groups.append(group)
     if out:
-        groups.append({"params": out, "dir_fn": lmo_out})
+        group = {"params": out, "dir_fn": lmo_out}
+        if args.optimizer == "scionc" and args.theta2_out is not None:
+            group["theta2"] = args.theta2_out
+        groups.append(group)
 
-    return ScionC(
-        groups, lr=args.lr, beta2=args.beta2, phi=args.phi, eta=args.eta, cwd=args.cwd
+    common_kwargs = dict(
+        lr=args.lr,
+        beta2=args.beta2,
+        phi=args.phi,
+        eta=args.eta,
+        cwd=args.cwd,
     )
+    if args.optimizer == "scion":
+        return Scion(groups, **common_kwargs)
+    if args.optimizer == "scionc":
+        return ScionC(groups, **common_kwargs)
+    raise ValueError(f"unknown optimizer: {args.optimizer}")
 
 
 def save_checkpoint(path: Path, model: GPT, dataset: CharDataset, args):
@@ -202,7 +221,7 @@ def train(args):
     source = BatchSource(
         dataset.train, dataset.val, args.block_size, args.batch_size, device
     )
-    opt = build_scionc(raw_model, args, device)
+    opt = build_optimizer(raw_model, args, device)
     model, compile_seconds = maybe_compile(raw_model, source, args, amp_dtype, device)
 
     if compile_seconds > 0.0:
@@ -339,7 +358,7 @@ def make_parser():
     p = argparse.ArgumentParser()
     p.add_argument("--mode", choices=["train", "sample"], default="train")
     p.add_argument("--data-path", default="data/tiny_shakespeare.txt")
-    p.add_argument("--out-path", default="out/scionc_shakespeare.pt")
+    p.add_argument("--out-path", default="out/scion_shakespeare.pt")
     p.add_argument("--device", default="")
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--compile", action="store_true", default=True)
@@ -365,12 +384,16 @@ def make_parser():
     p.add_argument("--warmup-frac", type=float, default=0.0)
     p.add_argument("--decay-frac", type=float, default=0.2)
 
+    p.add_argument("--optimizer", choices=["scion", "scionc"], default="scion")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--min-lr", type=float, default=0.0)
     p.add_argument("--beta2", type=float, default=0.95)
     p.add_argument("--phi", type=float, default=0.0)
-    p.add_argument("--eta", type=float, default=0.0)
+    p.add_argument("--eta", type=float, default=None)
     p.add_argument("--cwd", action="store_true")
+    p.add_argument("--theta2-embed", type=float, default=None)
+    p.add_argument("--theta2-hidden", type=float, default=None)
+    p.add_argument("--theta2-out", type=float, default=None)
     p.add_argument("--pe-steps", type=int, default=5)
     p.add_argument("--rho-embed", type=float, default=1.0)
     p.add_argument("--rho-hidden", type=float, default=3.0)
