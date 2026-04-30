@@ -94,8 +94,33 @@ def line_object_stats_text(stats: dict[str, dict]) -> str:
             f"ua/r={values['update_abs_rms']:.3f},"
             f"gk={values['grad_kurtosis']:.2e},"
             f"uk={values['update_kurtosis']:.2e}"
+            f"{optional_object_text(values)}"
         )
     return " | obj_stats " + "; ".join(parts) if parts else ""
+
+
+def optional_object_text(values: dict) -> str:
+    parts = []
+    fields = (
+        ("v/g", "atom_grad_rms", ".2e"),
+        ("v/p", "atom_param_rms", ".2e"),
+        ("gv", "grad_atom_cos", ".3f"),
+        ("xv", "param_atom_cos", ".3f"),
+        ("uv", "update_atom_cos", ".3f"),
+        ("vk", "atom_kurtosis", ".2e"),
+        ("m/g", "mom_grad_rms", ".2e"),
+        ("m/p", "mom_param_rms", ".2e"),
+        ("gm", "grad_mom_cos", ".3f"),
+        ("xm", "param_mom_cos", ".3f"),
+        ("um", "update_mom_cos", ".3f"),
+        ("mv", "mom_atom_cos", ".3f"),
+        ("mk", "mom_kurtosis", ".2e"),
+    )
+    for label, key, fmt in fields:
+        value = values.get(key)
+        if value is not None:
+            parts.append(f"{label}={value:{fmt}}")
+    return "," + ",".join(parts) if parts else ""
 
 
 def line_curve_text(step: int, losses: list[tuple[float, float]]) -> str:
