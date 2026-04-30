@@ -20,7 +20,7 @@ Model choices:
 Files:
 
 - `lionk_ccwd.py`: Lion-K core with optional corrected decoupled decay
-- `scion.py`: Scion LMOs, geometry-matched initialization helpers, LR transfer helper, workspace reuse in the polar spectral LMO, and streaming SVD spectral LMO
+- `scion.py`: Scion LMOs, geometry-matched initialization helpers, LR transfer helper, Gram Newton-Schulz baseline LMO, and streaming SVD spectral LMO
 - `gpt.py` + `train_shakespeare.py`: a small GPT training loop for tiny Shakespeare, with val-only evals during training and best-or-final checkpointing
 
 ## Main policy
@@ -65,7 +65,7 @@ There is also an experimental hidden-only closed-form filter:
 - with `full`, the MLP input covariance is shared between SwiGLU `gate` and `up`
 - recommended faster-quality tradeoff: `--hidden-lmo svd-filter --filter-metric grad-sigma --spi-refresh-interval 100`
 
-Use `--hidden-lmo polar` to restore the previous polynomial polar approximation.
+Use `--hidden-lmo gram-ns` for the baseline. This is the Gram Newton-Schulz form from Dao-AILab's implementation: five Polar Express coefficient steps with the 1.05 safety factor, a Gram-space update for rectangular matrices, a reset at iteration 2, and a cheap two-moment spectral upper-bound normalization from the already-formed Gram.
 
 ## Exact single-run schedule
 

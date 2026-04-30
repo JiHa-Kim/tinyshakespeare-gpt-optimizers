@@ -18,11 +18,11 @@ from gpt import (
 )
 from scion import (
     ColNormLMO,
+    GramNewtonSchulzLMO,
     HiddenSVDFilterLMO,
     Scion,
     ScionC,
     SignLMO,
-    SpectralLMO,
     StreamingSVDSpectralLMO,
     init_colnorm_,
     init_sign_,
@@ -134,7 +134,7 @@ def resolve_group_lr(args, group: str) -> tuple[float, float]:
 
 @torch.no_grad()
 def build_optimizer(model: GPT, args, device: torch.device):
-    work_dtype = torch.bfloat16 if device.type == "cuda" else None
+    gns_dtype = torch.float16 if device.type == "cuda" else torch.float32
     if (
         args.optimizer == "scionc"
         and args.eta is None
@@ -151,8 +151,10 @@ def build_optimizer(model: GPT, args, device: torch.device):
     groups = []
 
     def hidden_lmo():
-        if args.hidden_lmo == "polar":
-            return SpectralLMO(args.rho_hidden, args.pe_steps, work_dtype=work_dtype)
+        if args.hidden_lmo == "gram-ns":
+            return GramNewtonSchulzLMO(
+                args.rho_hidden, args.pe_steps, work_dtype=gns_dtype
+            )
         if args.hidden_lmo == "svd-filter":
             return HiddenSVDFilterLMO(
                 radius=args.rho_hidden,
@@ -566,11 +568,11 @@ def make_parser():
     p.add_argument("--theta2-out", type=float, default=None)
     p.add_argument(
         "--hidden-lmo",
-        choices=["streaming-svd", "svd-filter", "polar"],
+        choices=["streaming-svd", "svd-filter", "gram-ns"],
         default="streaming-svd",
-        help="hidden-matrix LMO; svd-filter uses hidden activation covariance",
+        help="hidden-matrix LMO; gram-ns is the baseline",
     )
-    p.add_argument("--pe-steps", type=int, default=5)
+    p.add_argument("--pe-steps", type=int, default=5, help="Gram-NS coefficient steps")
     p.add_argument("--spi-steps", type=int, default=1)
     p.add_argument("--spi-ridge", type=float, default=1e-3)
     p.add_argument("--filter-ridge", type=float, default=1e-3)

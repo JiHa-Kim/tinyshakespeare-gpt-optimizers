@@ -8,6 +8,7 @@ from lionk_ccwd import LionKCCWDPA, lionk_S
 __all__ = [
     "ColNormLMO",
     "RowNormLMO",
+    "GramNewtonSchulzLMO",
     "SpectralLMO",
     "StreamingSVDSpectralLMO",
     "HiddenSVDFilterLMO",
@@ -23,96 +24,151 @@ __all__ = [
 ]
 
 
-_PE = (
+_GNS_COEFFS = (
     (
-        8.28721201814563 / 1.01,
-        -23.595886519098837 / (1.01**3),
-        17.300387312530933 / (1.01**5),
+        8.28721201814563 / 1.05,
+        -23.595886519098837 / (1.05**3),
+        17.300387312530933 / (1.05**5),
     ),
     (
-        4.107059111542203 / 1.01,
-        -2.9478499167379106 / (1.01**3),
-        0.5448431082926601 / (1.01**5),
+        4.107059111542203 / 1.05,
+        -2.9478499167379106 / (1.05**3),
+        0.5448431082926601 / (1.05**5),
     ),
     (
-        3.9486908534822946 / 1.01,
-        -2.908902115962949 / (1.01**3),
-        0.5518191394370137 / (1.01**5),
+        3.9486908534822946 / 1.05,
+        -2.908902115962949 / (1.05**3),
+        0.5518191394370137 / (1.05**5),
     ),
     (
-        3.3184196573706015 / 1.01,
-        -2.488488024314874 / (1.01**3),
-        0.51004894012372 / (1.01**5),
+        3.3184196573706015 / 1.05,
+        -2.488488024314874 / (1.05**3),
+        0.51004894012372 / (1.05**5),
     ),
     (
-        2.300652019954817 / 1.01,
-        -1.6689039845747493 / (1.01**3),
-        0.4188073119525673 / (1.01**5),
+        2.300652019954817 / 1.05,
+        -1.6689039845747493 / (1.05**3),
+        0.4188073119525673 / (1.05**5),
     ),
-    (
-        1.891301407787398 / 1.01,
-        -1.2679958271945868 / (1.01**3),
-        0.37680408948524835 / (1.01**5),
-    ),
-    (
-        1.8750014808534479 / 1.01,
-        -1.2500016453999487 / (1.01**3),
-        0.3750001645474248 / (1.01**5),
-    ),
-    (1.875, -1.25, 0.375),
 )
+_GNS_RESETS = frozenset({2})
 
 
-def polar_express_uvt(
+def _gns_coeff(i: int) -> tuple[float, float, float]:
+    return _GNS_COEFFS[i if i < len(_GNS_COEFFS) else -1]
+
+
+def _gns_work_dtype(x: torch.Tensor, work_dtype: torch.dtype | None) -> torch.dtype:
+    if work_dtype is not None:
+        return work_dtype
+    return torch.float16 if x.is_cuda else torch.float32
+
+
+def _moment2_beta(gram: torch.Tensor, eps: float, safety: float) -> torch.Tensor:
+    n = gram.size(-1)
+    t1 = (
+        gram.diagonal(dim1=-2, dim2=-1)
+        .sum(-1, dtype=torch.float32)
+        .clamp_min(eps)
+    )
+    r2 = gram.square().sum(dim=(-2, -1), dtype=torch.float32)
+    m2 = r2.div(t1.square()).clamp_min(1.0 / n)
+    beta = 1.0 / n + torch.sqrt(((n - 1.0) / n) * (m2 - 1.0 / n))
+    return beta.mul(safety).clamp_min(eps)
+
+
+def _moment2_gram_scale(
+    x: torch.Tensor, gram: torch.Tensor, eps: float, safety: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    beta = _moment2_beta(gram, eps, safety)
+    inv = torch.rsqrt(beta).reshape(-1, 1, 1)
+    inv_x = inv.to(x.dtype)
+    return gram * inv_x.square(), inv_x
+
+
+def _gram_newton_schulz_core(
+    x: torch.Tensor, steps: int, eps: float, bound_safety: float
+) -> torch.Tensor:
+    gram = torch.bmm(x, x.mT)
+    gram, x_scale = _moment2_gram_scale(x, gram, eps, bound_safety)
+    eye = torch.eye(gram.size(-1), dtype=x.dtype, device=x.device).expand_as(gram)
+    q = None
+
+    for i in range(steps):
+        a, b, c = _gns_coeff(i)
+        if i in _GNS_RESETS and q is not None:
+            if x_scale is not None:
+                q = q * x_scale
+                x_scale = None
+            x = torch.bmm(q, x)
+            gram = torch.bmm(x, x.mT)
+            q = None
+
+        z = torch.baddbmm(gram, gram, gram, beta=b, alpha=c)
+        q = z + a * eye if q is None else torch.baddbmm(q, q, z, beta=a)
+
+        if i < steps - 1 and i + 1 not in _GNS_RESETS:
+            rz = torch.baddbmm(gram, gram, z, beta=a)
+            gram = torch.baddbmm(rz, z, rz, beta=a)
+
+    if q is None:
+        return x
+    if x_scale is not None:
+        q = q * x_scale
+    return torch.bmm(q, x)
+
+
+def _standard_newton_schulz_core(
+    x: torch.Tensor, steps: int, eps: float, bound_safety: float
+) -> torch.Tensor:
+    gram = torch.bmm(x, x.mT)
+    gram, x_scale = _moment2_gram_scale(x, gram, eps, bound_safety)
+    for i in range(steps):
+        a, b, c = _gns_coeff(i)
+        if i:
+            gram = torch.bmm(x, x.mT)
+        update = torch.baddbmm(gram, gram, gram, beta=b, alpha=c)
+        x = torch.baddbmm(x, update, x, beta=a)
+        if x_scale is not None:
+            x = x * x_scale
+            x_scale = None
+    return x
+
+
+def gram_newton_schulz_uvt(
     g: torch.Tensor,
     steps: int = 5,
     eps: float = 1e-7,
     work_dtype: torch.dtype | None = None,
-    workspace: dict | None = None,
+    bound_safety: float = 1.05,
 ) -> torch.Tensor:
-    if g.ndim != 2:
-        raise ValueError("polar_express_uvt expects a 2D tensor")
+    if g.ndim < 2:
+        raise ValueError("gram_newton_schulz_uvt expects a matrix or batch of matrices")
 
-    if work_dtype is None:
-        work_dtype = torch.bfloat16 if g.is_cuda else g.dtype
-    x = g.to(work_dtype)
-    transposed = x.size(0) > x.size(1)
+    original_shape = g.shape
+    original_dtype = g.dtype
+    x = g.reshape(-1, *g.shape[-2:]) if g.ndim > 3 else g
+    if x.ndim == 2:
+        x = x.unsqueeze(0)
+
+    x = x.to(torch.float32)
+    transposed = x.size(-2) > x.size(-1)
     if transposed:
         x = x.mT
 
-    x = x / (torch.linalg.vector_norm(x) * 1.01 + eps)
-    n = len(_PE)
-    buffers = (
-        None
-        if workspace is None
-        else workspace.setdefault((tuple(x.shape), x.dtype, x.device), {})
-    )
-    if buffers is not None:
-        rows, cols = x.shape
-        gram_shape = (rows, rows)
-        if buffers.get("A") is None or tuple(buffers["A"].shape) != gram_shape:
-            buffers["A"] = torch.empty(gram_shape, dtype=x.dtype, device=x.device)
-        if buffers.get("AX") is None or tuple(buffers["AX"].shape) != (rows, cols):
-            buffers["AX"] = torch.empty((rows, cols), dtype=x.dtype, device=x.device)
-        if buffers.get("AAX") is None or tuple(buffers["AAX"].shape) != (rows, cols):
-            buffers["AAX"] = torch.empty((rows, cols), dtype=x.dtype, device=x.device)
+    x = x / (torch.linalg.vector_norm(x, dim=(-2, -1), keepdim=True) + eps)
+    x = x.to(_gns_work_dtype(g, work_dtype))
+    if max(x.shape[-2:]) > min(x.shape[-2:]):
+        x = _gram_newton_schulz_core(x, steps, eps, bound_safety)
+    else:
+        x = _standard_newton_schulz_core(x, steps, eps, bound_safety)
 
-    for i in range(steps):
-        a, b, c = _PE[i if i < n else n - 1]
-        if buffers is None:
-            A = x @ x.mT
-            AX = A @ x
-            AAX = A @ AX
-        else:
-            A = buffers["A"]
-            AX = buffers["AX"]
-            AAX = buffers["AAX"]
-            torch.mm(x, x.mT, out=A)
-            torch.mm(A, x, out=AX)
-            torch.mm(A, AX, out=AAX)
-        x.mul_(a).add_(AX, alpha=b).add_(AAX, alpha=c)
-
-    return (x.mT if transposed else x).to(g.dtype)
+    if transposed:
+        x = x.mT
+    x = x.to(original_dtype)
+    if len(original_shape) == 2:
+        return x.squeeze(0)
+    return x.reshape(original_shape)
 
 
 class ColNormLMO:
@@ -164,8 +220,8 @@ class SignLMO:
         return x.mT if self.transpose else x
 
 
-class SpectralLMO:
-    __slots__ = ("radius", "steps", "eps", "work_dtype", "input_like", "workspace")
+class GramNewtonSchulzLMO:
+    __slots__ = ("radius", "steps", "eps", "work_dtype", "input_like", "bound_safety")
 
     def __init__(
         self,
@@ -174,21 +230,56 @@ class SpectralLMO:
         eps: float = 1e-7,
         work_dtype: torch.dtype | None = None,
         input_like: bool = False,
+        bound_safety: float = 1.05,
     ):
         self.radius = radius
         self.steps = steps
         self.eps = eps
         self.work_dtype = work_dtype
         self.input_like = input_like
-        self.workspace = {}
+        self.bound_safety = bound_safety
+
+    def _scale(self, x: torch.Tensor) -> float:
+        scale = math.sqrt(x.size(-2) / x.size(-1))
+        return max(1.0, scale) if self.input_like else scale
 
     def __call__(self, v: torch.Tensor) -> torch.Tensor:
-        scale = math.sqrt(v.size(0) / v.size(1))
-        if self.input_like:
-            scale = max(1.0, scale)
-        return polar_express_uvt(
-            v, self.steps, self.eps, self.work_dtype, self.workspace
-        ).mul_(-self.radius * scale)
+        if v.ndim != 2:
+            raise ValueError("GramNewtonSchulzLMO expects a 2D tensor")
+        return gram_newton_schulz_uvt(
+            v, self.steps, self.eps, self.work_dtype, self.bound_safety
+        ).mul_(-self.radius * self._scale(v))
+
+    def batch(
+        self, tensors: list[torch.Tensor], params: list[torch.Tensor]
+    ) -> list[torch.Tensor]:
+        out: list[torch.Tensor | None] = [None] * len(tensors)
+        groups: dict[tuple, list[tuple[int, torch.Tensor]]] = {}
+
+        for i, (x, _) in enumerate(zip(tensors, params, strict=True)):
+            if x.ndim != 2:
+                out[i] = self(x)
+                continue
+            key = (tuple(x.shape), x.dtype, x.device)
+            groups.setdefault(key, []).append((i, x))
+
+        for items in groups.values():
+            y_batch = gram_newton_schulz_uvt(
+                torch.stack([x for _, x in items]),
+                self.steps,
+                self.eps,
+                self.work_dtype,
+                self.bound_safety,
+            )
+            for j, (i, x) in enumerate(items):
+                out[i] = y_batch[j].mul_(-self.radius * self._scale(x))
+
+        if any(x is None for x in out):
+            raise RuntimeError("batched GramNewtonSchulzLMO missed an output")
+        return out
+
+
+SpectralLMO = GramNewtonSchulzLMO
 
 
 def _column_inverse_scale(x: torch.Tensor, eps: float) -> torch.Tensor:
@@ -196,9 +287,7 @@ def _column_inverse_scale(x: torch.Tensor, eps: float) -> torch.Tensor:
     return norms.reciprocal()
 
 
-def _normalize_columns(
-    x: torch.Tensor, eps: float
-) -> tuple[torch.Tensor, torch.Tensor]:
+def _normalize_columns(x: torch.Tensor, eps: float) -> tuple[torch.Tensor, torch.Tensor]:
     inv_scale = _column_inverse_scale(x, eps)
     return x * inv_scale, inv_scale
 
@@ -361,9 +450,7 @@ class StreamingSVDSpectralLMO:
             v = torch.eye(m.size(-1), dtype=m.dtype, device=m.device)
         return v
 
-    def _store_basis_for(
-        self, p: torch.Tensor, m: torch.Tensor, v: torch.Tensor
-    ) -> None:
+    def _store_basis_for(self, p: torch.Tensor, m: torch.Tensor, v: torch.Tensor) -> None:
         key = (id(p), tuple(m.shape), m.dtype, m.device)
         self.states[key] = v.detach()
 
