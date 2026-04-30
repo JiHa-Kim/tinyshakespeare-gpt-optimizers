@@ -92,3 +92,28 @@ python -m scionc.train_shakespeare \
   --embed-lmo colnorm --out-lmo sign \
   --rho-embed 1 --rho-hidden 3 --rho-out 10
 ```
+
+## Current Result
+
+The current working recipe reached validation loss `1.3940` after 2k steps on
+tiny Shakespeare with batch size 64, gradient accumulation 1, block size 256,
+and about 2.28 GB reserved CUDA memory.
+
+Example sample from `out/scionc_wsd_lr0p035_min0.pt`, using temperature `0.8`
+and top-k `40`:
+
+```text
+To be, or not to be contented
+You in conscience, your brother and your grace,
+To make the people measure of these men.
+
+NORTHUMBERLAND:
+Your crown, sir, your body will confess
+I should soldier till you weep the season,
+And your tongue and yet I should be so;
+Or in that bear the town that Clarence shall be loud.
+
+BUCKINGHAM:
+Why, bear the warriors with the world my life,
+Who was an oath desires himself for stars.
+```
