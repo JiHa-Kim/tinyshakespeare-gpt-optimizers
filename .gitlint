@@ -1,0 +1,6 @@
+[general]
+# Ignore rules for body length and other defaults that might be too strict
+ignore=B5, B6, T3
+
+[title-match-regex]
+regex = ^(build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test|tune)\(.+\): .+$
