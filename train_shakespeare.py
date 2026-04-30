@@ -733,7 +733,7 @@ def make_parser():
     p.add_argument("--d-model", type=int, default=384)
     p.add_argument("--rope-base", type=float, default=10000.0)
     p.add_argument("--prenorm", choices=["rmsnorm", "rmsball"], default="rmsnorm")
-    p.add_argument("--dropout", type=float, default=0.10)
+    p.add_argument("--dropout", type=float, default=0.15)
 
     p.add_argument("--max-iters", type=int, default=2000)
     p.add_argument("--eval-interval", type=int, default=100)
@@ -758,8 +758,8 @@ def make_parser():
     p.add_argument(
         "--min-lr",
         type=float,
-        default=None,
-        help="decay floor; defaults to 10%% of each group's peak LR",
+        default=1e-4,
+        help="decay floor",
     )
     p.add_argument("--min-lr-embed", dest="min_lr_embed", type=float, default=None)
     p.add_argument("--min-lr-hidden", dest="min_lr_hidden", type=float, default=None)
@@ -777,8 +777,8 @@ def make_parser():
     p.add_argument(
         "--hidden-lmo",
         choices=["streaming-svd", "svd-filter", "gram-ns"],
-        default="svd-filter",
-        help="hidden-matrix LMO; gram-ns is the baseline",
+        default="gram-ns",
+        help="hidden-matrix LMO",
     )
     p.add_argument(
         "--embed-lmo",
