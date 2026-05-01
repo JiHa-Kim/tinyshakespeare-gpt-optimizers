@@ -11,7 +11,6 @@ from scionc.lmos.core import (
     init_semiorthogonal_,
     init_sign_,
     init_spectral_,
-    scion_transfer_lr,
 )
 from scionc.lmos.streaming_svd import HiddenSVDFilterLMO, StreamingSVDSpectralLMO
 
@@ -30,5 +29,4 @@ __all__ = [
     "init_semiorthogonal_",
     "init_sign_",
     "init_spectral_",
-    "scion_transfer_lr",
 ]

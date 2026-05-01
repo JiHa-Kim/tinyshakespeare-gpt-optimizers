@@ -19,7 +19,6 @@ __all__ = [
     "init_spectral_",
     "init_sign_",
     "init_semiorthogonal_",
-    "scion_transfer_lr",
     "ScionC",
 ]
 
@@ -338,22 +337,6 @@ def init_semiorthogonal_(
     w: torch.Tensor, radius: float = 1.0, input_like: bool = False
 ) -> torch.Tensor:
     return init_spectral_(w, radius=radius, input_like=input_like)
-
-
-def scion_transfer_lr(lr: float, mT: float = 1.0, mL: float = 1.0, alpha: float = 0.5):
-    if lr <= 0.0:
-        raise ValueError(f"invalid lr: {lr}")
-    if mT <= 0.0:
-        raise ValueError(f"invalid mT: {mT}")
-    if mL <= 0.0:
-        raise ValueError(f"invalid mL: {mL}")
-    token_factor = mT**-0.5
-    depth_factor = mL ** (alpha - 1.0)
-    return {
-        "embed": lr * token_factor,
-        "hidden": lr * token_factor * depth_factor,
-        "out": lr * token_factor,
-    }
 
 
 class ScionC(LionKCCWDPA):

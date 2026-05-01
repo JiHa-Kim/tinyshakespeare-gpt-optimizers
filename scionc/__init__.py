@@ -13,7 +13,6 @@ from scionc.lmos import (
     init_semiorthogonal_,
     init_sign_,
     init_spectral_,
-    scion_transfer_lr,
 )
 
 __all__ = [
@@ -31,5 +30,4 @@ __all__ = [
     "init_semiorthogonal_",
     "init_sign_",
     "init_spectral_",
-    "scion_transfer_lr",
 ]
