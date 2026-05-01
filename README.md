@@ -23,13 +23,7 @@ $$
 The step applies the effective LR and decay:
 
 $$
-X_{i,t+1}
-=
-X_{i,t}
-+
-\alpha_{i,t}V_{i,t}
--
-\alpha_{i,t}\lambda_i X_{i,t}.
+X_{i,t+1}=X_{i,t}+\alpha_{i,t}V_{i,t}-\alpha_{i,t}\lambda_i X_{i,t}.
 $$
 
 Constrained Scion radius $\rho_i$ is represented as $\lambda_i=1/\rho_i$.
