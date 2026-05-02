@@ -344,14 +344,15 @@ class ScionC(LionKCCWDPA):
         self,
         params,
         lr: float = 1e-4,
-        beta2: float = 0.95,
+        readout_mu: float = 1.0,
+        memory_beta: float = 0.95,
         dir_fn=None,
         eps: float = 1e-12,
     ):
         super().__init__(
             params=params,
             lr=lr,
-            betas=(1.0, beta2),
+            betas=(readout_mu, memory_beta),
             dir_fn=dir_fn,
             nesterov=True,
             eps=eps,

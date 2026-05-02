@@ -28,6 +28,8 @@ def capture_step_stats(optimizer: Optimizer) -> list[StepStatSnapshot]:
         eta = group.get("eta")
         if group.get("cwd", False) or group.get("phi", 0.0):
             eta = None
+        elif group.get("shrink") is not None:
+            eta = 1.0 - float(group["shrink"])
         elif eta is None and group.get("theta2") is None:
             eta = lr * float(group.get("weight_decay", 0.0))
         for p in group["params"]:

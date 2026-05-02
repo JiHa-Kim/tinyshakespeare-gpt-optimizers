@@ -34,13 +34,15 @@ def corrected_eta(
 class LionKCCWDPA(Optimizer):
     """
     Lion-K with corrected decoupled decay, optional cautious masking,
-    and optional primal averaging.
+    optional primal averaging, and direct multiplicative shrinkage.
 
     Parameters are kept at the gradient-eval point
         y_t = (1 - phi) z_t + phi x_t.
 
     `dir_fn` maps the momentum proxy to a negative update direction.
     `eta` applies fixed decoupled decay; otherwise it is derived from `theta2`.
+    `shrink` applies direct multiplicative shrinkage and takes precedence over
+    LR-scaled decay.
     """
 
     def __init__(
@@ -51,6 +53,7 @@ class LionKCCWDPA(Optimizer):
         dir_fn=sign_,
         phi: float = 0.0,
         eta: float | None = None,
+        shrink: float | None = None,
         theta2: float | None = None,
         cu2: float = 1.0,
         S: float | None = None,
@@ -66,6 +69,8 @@ class LionKCCWDPA(Optimizer):
             raise ValueError(f"invalid betas: {betas}")
         if not (0.0 <= phi <= 1.0):
             raise ValueError(f"invalid phi: {phi}")
+        if shrink is not None and not (0.0 < shrink <= 1.0):
+            raise ValueError(f"invalid shrink: {shrink}")
 
         super().__init__(
             params,
@@ -75,6 +80,7 @@ class LionKCCWDPA(Optimizer):
                 dir_fn=dir_fn,
                 phi=phi,
                 eta=eta,
+                shrink=shrink,
                 theta2=theta2,
                 cu2=cu2,
                 S=S,
@@ -103,6 +109,14 @@ class LionKCCWDPA(Optimizer):
             set_dir_param = getattr(dir_fn, "set_param", None)
             batch_dir = getattr(dir_fn, "batch", None)
 
+            shrink = group.get("shrink")
+            if shrink is not None:
+                shrink = float(shrink)
+                if not (0.0 < shrink <= 1.0):
+                    raise ValueError(f"invalid shrink: {shrink}")
+                if cwd:
+                    raise ValueError("direct shrink does not support cautious decay")
+
             if phi:
                 group["_pa_denom"] += lr * lr
                 c = (lr * lr) / group["_pa_denom"]
@@ -111,7 +125,7 @@ class LionKCCWDPA(Optimizer):
 
             eta = group["eta"]
             theta2 = group["theta2"]
-            if eta is None:
+            if shrink is None and eta is None:
                 if theta2 is None:
                     eta = lr * group.get("weight_decay", 0.0)
                 else:
@@ -184,7 +198,9 @@ class LionKCCWDPA(Optimizer):
                 )
 
             for (p, _, z, state), u in zip(entries, updates, strict=True):
-                if eta:
+                if shrink is not None:
+                    z.mul_(shrink)
+                elif eta:
                     if cwd:
                         z.addcmul_(p, (p * u > 0).to(dtype=p.dtype), value=-eta)
                     else:

@@ -2,7 +2,7 @@
 
 A tiny reference implementation organized by category:
 
-- `scionc/optim/`: general Lion-K core with optional cautious weight decay and primal averaging.
+- `scionc/optim/`: general Lion-K core with corrected decay, cautious masking, primal averaging, and direct shrinkage.
 - `scionc/lmos/`: ScionC wrapper, basic LMOs, Gram-NS, streaming SVD, SVD-filter, and geometry-matched init helpers.
 - `scionc/models/`: compact GPT model and tiny Shakespeare data utilities.
 - `scionc/probes/`: optional line, convergence, and optimizer-step stats probes.
@@ -10,7 +10,9 @@ A tiny reference implementation organized by category:
 
 ## Active Recipe
 
-The Shakespeare training script uses ScionC in standard Lion-K coordinates.
+The Shakespeare training script uses ScionC in token half-life coordinates.
+One optimizer update advances the count by
+`batch_size * block_size * grad_accum` processed tokens.
 
 For optimizer group `i`, the LMO returns a unit atom:
 
@@ -20,15 +22,30 @@ V_{i,t}=\operatorname{LMO}_{g_i}(M_{i,t}),
 \|V_{i,t}\|_{g_i}=1.
 $$
 
-The step applies the effective LR and decay:
+EMA memory and direct shrinkage are multiplicative actions:
 
 $$
-X_{i,t+1}=X_{i,t}+\alpha_{i,t}V_{i,t}-\alpha_{i,t}\lambda_i X_{i,t}.
+\beta_t=2^{-\Delta\tau/h_\beta},
+\qquad
+a_{i,t}=2^{-\Delta\tau/h_{a,i}}.
 $$
 
-Constrained Scion radius $\rho_i$ is represented as $\lambda_i=1/\rho_i$.
-The scheduled learning rate is the Lion-K effective LR $\alpha_t$.
-`--beta2` controls the current EMA gradient proxy used by the LMO
+The step applies direct shrinkage and the additive LR separately:
+
+$$
+M_{i,t+1}=\beta_t M_{i,t}+(1-\beta_t)G_{i,t},
+\qquad
+X_{i,t+1}=a_{i,t}X_{i,t}+\alpha_{i,t}V_{i,t}.
+$$
+
+The scheduled learning rate is the additive scale $\alpha_t$. `--readout-mu`
+controls the dimensionless Nesterov readout blend. The `--rho-*` values are
+geometry-matched initialization radii only; shrinkage is controlled by
+`--shrink-half-life*`.
+
+The lower-level optimizer still exposes corrected decay, cautious masking, and
+primal averaging for experiments. The Shakespeare recipe always supplies direct
+`shrink` factors, so those decay paths are not part of this training entrypoint.
 
 Current defaults:
 
@@ -41,22 +58,21 @@ Current defaults:
 - block size: 256
 - peak LR: 0.035
 - decay floor: 0
-- beta2: 0.93
+- readout mu: 1
+- EMA half-life: about 1.56e5 processed tokens
+- shrink half-lives:
+  - embedding: about 3.19e5 processed tokens
+  - hidden: about 9.68e5 processed tokens
+  - output: about 3.24e6 processed tokens
 - WSD schedule: 100 warmup steps, stable phase, 15% decay by default
-
-The general Lion-K core still supports cautious weight decay. It is out of scope
-for the ScionC Shakespeare recipe.
-
-The general Lion-K core also supports primal averaging. It is out of scope for
-the ScionC Shakespeare recipe.
 
 Default radii:
 
-| Group | Geometry | Radius | Decay |
-|---|---|---:|---:|
-| input embedding | ColNorm | 1 | 1 |
-| hidden matrices | spectral | 3 | 0.333333 |
-| output head | Sign | 10 | 0.1 |
+| Group | Geometry | Radius |
+|---|---|---:|
+| input embedding | ColNorm | 1 |
+| hidden matrices | spectral | 3 |
+| output head | Sign | 10 |
 
 ## Hidden LMOs
 
@@ -82,10 +98,13 @@ uv run python -m scionc.train_shakespeare \
   --n-layer 6 --n-head 6 --d-model 384 \
   --lr 3.5e-2 --min-lr 0 \
   --warmup-iters 100 --decay-frac 0.15 \
-  --beta2 0.93 \
+  --beta-half-life 1.565e5 --readout-mu 1 \
   --hidden-lmo gram-ns \
   --embed-lmo colnorm --out-lmo sign \
-  --rho-embed 1 --rho-hidden 3 --rho-out 10
+  --rho-embed 1 --rho-hidden 3 --rho-out 10 \
+  --shrink-half-life-embed 3.188e5 \
+  --shrink-half-life-hidden 9.677e5 \
+  --shrink-half-life-out 3.239e6
 ```
 
 ## Current Result

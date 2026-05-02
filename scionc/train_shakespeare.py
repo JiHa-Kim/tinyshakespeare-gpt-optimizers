@@ -45,6 +45,13 @@ from scionc.probes.optimizer_stats import (
     consume_step_stats,
 )
 
+DEFAULT_BETA_HALF_LIFE = 156_489.1137547854
+DEFAULT_SHRINK_HALF_LIVES = {
+    "embed": 318_760.11959306244,
+    "hidden": 967_726.9243144159,
+    "out": 3_239_039.393395033,
+}
+
 
 def sync_now(device: torch.device) -> float:
     if device.type == "cuda":
@@ -196,6 +203,33 @@ def resolve_group_lr(args, group: str) -> tuple[float, float]:
     return peak, min_lr
 
 
+def count_increment(args) -> int:
+    return args.batch_size * args.block_size * args.grad_accum
+
+
+def halving_factor(delta_tau: float, half_life: float, name: str) -> float:
+    if delta_tau <= 0.0:
+        raise ValueError(f"invalid count increment: {delta_tau}")
+    if half_life <= 0.0:
+        raise ValueError(f"invalid {name}: {half_life}")
+    if math.isinf(half_life):
+        return 1.0
+    return 2.0 ** (-delta_tau / half_life)
+
+
+def resolve_group_shrink_half_life(
+    args, group: str
+) -> float:
+    half_life = getattr(args, f"shrink_half_life_{group}", None)
+    if half_life is None:
+        half_life = args.shrink_half_life
+    if half_life is None:
+        half_life = DEFAULT_SHRINK_HALF_LIVES[group]
+    if half_life <= 0.0:
+        raise ValueError(f"invalid {group} shrink half-life: {half_life}")
+    return half_life
+
+
 def apply_auto_group_lrs(opt, summary: dict[str, dict[str, float]], args) -> str:
     parts = []
     for group in opt.param_groups:
@@ -217,6 +251,9 @@ def apply_auto_group_lrs(opt, summary: dict[str, dict[str, float]], args) -> str
 @torch.no_grad()
 def build_optimizer(model: GPT, args, device: torch.device):
     gns_dtype = torch.float16 if device.type == "cuda" else torch.float32
+    delta_tau = count_increment(args)
+    beta_half_life = args.beta_half_life
+    memory_beta = halving_factor(delta_tau, beta_half_life, "beta_half_life")
     skip = {id(model.tok_emb.weight), id(model.lm_head.weight)}
     hidden = [p for p in model.parameters() if p.requires_grad and id(p) not in skip]
     groups = []
@@ -262,6 +299,10 @@ def build_optimizer(model: GPT, args, device: torch.device):
             return
         peak_lr, min_lr = resolve_group_lr(args, name)
         radius = max(float(radius), 1e-12)
+        shrink_half_life = resolve_group_shrink_half_life(args, name)
+        shrink = halving_factor(
+            delta_tau, shrink_half_life, f"{name}_shrink_half_life"
+        )
         group = {
             "name": name,
             "params": params,
@@ -271,7 +312,10 @@ def build_optimizer(model: GPT, args, device: torch.device):
             "max_lr": peak_lr,
             "min_lr": min_lr,
             "radius": radius,
-            "weight_decay": 1.0 / radius,
+            "shrink": shrink,
+            "shrink_half_life": shrink_half_life,
+            "beta_half_life": beta_half_life,
+            "count_increment": delta_tau,
         }
         groups.append(group)
 
@@ -293,7 +337,8 @@ def build_optimizer(model: GPT, args, device: torch.device):
     return ScionC(
         groups,
         lr=default_lr,
-        beta2=args.beta2,
+        readout_mu=args.readout_mu,
+        memory_beta=memory_beta,
     )
 
 
@@ -507,7 +552,11 @@ def train(args):
     warmup_steps, stable_steps, decay_steps = resolve_schedule(
         args.max_iters, warmup_steps, decay_steps
     )
-    effective_tokens = args.batch_size * args.block_size * args.grad_accum
+    effective_tokens = count_increment(args)
+    readout_mu, memory_beta = opt.param_groups[0].get(
+        "betas", (args.readout_mu, math.nan)
+    )
+    beta_half_life = opt.param_groups[0].get("beta_half_life", math.nan)
 
     group_schedule = []
     for group in opt.param_groups:
@@ -515,13 +564,18 @@ def train(args):
         peak_lr = group.get("peak_lr", group["lr"])
         min_lr = group.get("min_lr", args.min_lr)
         radius = group.get("radius", 1.0)
-        wd = group.get("weight_decay", 0.0)
+        shrink = group.get("shrink", 1.0)
+        shrink_half_life = group.get("shrink_half_life", math.inf)
         group_schedule.append(
-            f"{name}=({peak_lr:.3e}->{min_lr:.3e},rho={radius:g},wd={wd:.3g})"
+            f"{name}=({peak_lr:.3e}->{min_lr:.3e},rho={radius:g},"
+            f"h_a={shrink_half_life:.3g},a={shrink:.6f})"
         )
     print(
         "schedule "
         f"warmup_steps={warmup_steps} stable_steps={stable_steps} decay_steps={decay_steps} "
+        f"count_increment={effective_tokens} "
+        f"beta_half_life={beta_half_life:.3g} beta={memory_beta:.6f} "
+        f"readout_mu={readout_mu:.3g} "
         f"optimizer=scionc prenorm={args.prenorm} dropout={args.dropout:.3f} "
         f"hidden_lmo={args.hidden_lmo} "
         f"embed_lmo={args.embed_lmo} out_lmo={args.out_lmo} "
@@ -887,7 +941,18 @@ def make_parser():
     p.add_argument(
         "--min-lr-out", "--min-lr-unembed", dest="min_lr_out", type=float, default=None
     )
-    p.add_argument("--beta2", type=float, default=0.93)
+    p.add_argument(
+        "--beta-half-life",
+        type=float,
+        default=DEFAULT_BETA_HALF_LIFE,
+        help="EMA memory half-life in processed tokens",
+    )
+    p.add_argument(
+        "--readout-mu",
+        type=float,
+        default=1.0,
+        help="dimensionless Nesterov readout blend",
+    )
     p.add_argument(
         "--hidden-lmo",
         choices=["streaming-svd", "svd-filter", "gram-ns"],
@@ -921,6 +986,31 @@ def make_parser():
     p.add_argument("--rho-embed", type=float, default=1.0)
     p.add_argument("--rho-hidden", type=float, default=3.0)
     p.add_argument("--rho-out", type=float, default=10.0)
+    p.add_argument(
+        "--shrink-half-life",
+        type=float,
+        default=None,
+        help="direct shrink half-life in processed tokens for all groups",
+    )
+    p.add_argument(
+        "--shrink-half-life-embed",
+        dest="shrink_half_life_embed",
+        type=float,
+        default=None,
+    )
+    p.add_argument(
+        "--shrink-half-life-hidden",
+        dest="shrink_half_life_hidden",
+        type=float,
+        default=None,
+    )
+    p.add_argument(
+        "--shrink-half-life-out",
+        "--shrink-half-life-unembed",
+        dest="shrink_half_life_out",
+        type=float,
+        default=None,
+    )
 
     p.add_argument("--prompt", default="To be, or not to be")
     p.add_argument("--sample-tokens", type=int, default=400)
