@@ -277,22 +277,22 @@ def input_output_tied(model: GPT) -> bool:
     return model.tok_emb.weight is model.lm_head.weight
 
 
-def make_embed_ulmo(args, tied: bool = False):
-    if tied:
-        return SignULMO()
-    if args.embed_ulmo == "sign":
-        return SignULMO()
-    if args.embed_ulmo == "rownorm":
+def make_edge_ulmo(kind: str):
+    if kind == "colnorm":
+        return ColNormULMO(transpose=True)
+    if kind == "rownorm":
         return RowNormULMO()
-    return ColNormULMO(transpose=True)
+    if kind == "sign":
+        return SignULMO()
+    raise ValueError(f"unsupported edge ULMO: {kind}")
+
+
+def make_embed_ulmo(args, tied: bool = False):
+    return SignULMO() if tied else make_edge_ulmo(args.embed_ulmo)
 
 
 def make_out_ulmo(args):
-    if args.out_ulmo == "colnorm":
-        return ColNormULMO(transpose=True)
-    if args.out_ulmo == "rownorm":
-        return RowNormULMO()
-    return SignULMO()
+    return make_edge_ulmo(args.out_ulmo)
 
 
 def hidden_params(model: GPT) -> list[torch.Tensor]:
@@ -383,28 +383,23 @@ def optimizer_group(
     }
 
 
-def input_output_groups(model: GPT, args, delta_tau: int) -> list[dict]:
+def optimizer_group_specs(model: GPT, args, work_dtype: torch.dtype):
     tied = input_output_tied(model)
-    groups = [
-        optimizer_group(
+    specs = [
+        (
             "embed",
             [model.tok_emb.weight],
             make_embed_ulmo(args, tied),
-            args,
-            delta_tau,
-        )
+        ),
+        (
+            "hidden",
+            hidden_params(model),
+            make_hidden_ulmo(args, work_dtype),
+        ),
     ]
     if not tied:
-        groups.append(
-            optimizer_group(
-                "out",
-                [model.lm_head.weight],
-                make_out_ulmo(args),
-                args,
-                delta_tau,
-            )
-        )
-    return [group for group in groups if group is not None]
+        specs.append(("out", [model.lm_head.weight], make_out_ulmo(args)))
+    return specs
 
 
 @torch.no_grad()
@@ -412,17 +407,11 @@ def build_optimizer(model: GPT, args, device: torch.device):
     delta_tau = count_increment(args)
     memory_beta = halving_factor(delta_tau, args.beta_half_life, "beta_half_life")
     work_dtype = torch.float16 if device.type == "cuda" else torch.float32
-    groups = [
-        *input_output_groups(model, args, delta_tau),
-        optimizer_group(
-            "hidden",
-            hidden_params(model),
-            make_hidden_ulmo(args, work_dtype),
-            args,
-            delta_tau,
-        ),
-    ]
-    groups = [group for group in groups if group is not None]
+    groups = []
+    for name, params, ulmo in optimizer_group_specs(model, args, work_dtype):
+        group = optimizer_group(name, params, ulmo, args, delta_tau)
+        if group is not None:
+            groups.append(group)
     init_from_actions_(groups)
 
     hidden_group = next(group for group in groups if group["name"] == "hidden")
