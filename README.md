@@ -41,7 +41,7 @@ X \leftarrow \zeta X+\eta V.
 ```
 
 The same equations apply independently to embedding, hidden, and output groups,
-with group-specific ULMOs, steady-state radii, shrink half-lives, and
+with group-specific ULMOs, reference radii, shrink half-lives, and
 dimensionless step-scale schedules. The raw additive step $\eta_t$ is derived by
 the geometry invariant rule:
 
@@ -54,8 +54,10 @@ s_{\mathrm{peak}}(1-\zeta_t)\rho.
 ```
 
 Here $\zeta_0$ is the peak shrink factor from the shrink half-life, and $r_t$
-is the warmup/stable/decay schedule ratio. Scheduling the shrink rate exactly
-uses $\zeta_t=\zeta_0^{r_t}$, so $\zeta_t\to1$ as the schedule decays to zero.
+is the per-update warmup/stable/decay schedule ratio. Equivalently, $r_t$ is
+the interval-average shrink-rate multiplier for that optimizer update. With
+this convention, $\zeta_t=\zeta_0^{r_t}$ and $\zeta_t\to1$ as the schedule
+decays to zero.
 With $s_{\mathrm{peak}}=1$, the radius ball is invariant under a persistent unit
 ULMO atom: $\|X_{\mathrm{new}}\|\le\rho$ whenever $\|X\|\le\rho$. Peak tuning
 uses the dimensionless coordinate $\ell=\log_2 s_{\mathrm{peak}}$, so changing
@@ -65,9 +67,9 @@ compatibility override.
 
 `--readout-mu` controls the dimensionless Nesterov readout blend. Shrinkage is
 controlled by `--shrink-half-life*`. Geometry-matched initialization uses the
-same steady-state radius $\rho$.
+same reference radius $\rho$.
 
-See [docs/scionc_steady_state_parametrization.md](docs/scionc_steady_state_parametrization.md)
+See [docs/scionc_reference_radius_parametrization.md](docs/scionc_reference_radius_parametrization.md)
 for the derivation.
 
 The lower-level optimizer still exposes corrected decay, cautious masking, and
@@ -89,7 +91,7 @@ Current defaults:
   - embedding: 0.035
   - hidden: 0.035
   - output: 0.035
-- steady-state radii: embedding 1, hidden 3, output 10
+- reference radii: embedding 1, hidden 3, output 10
 - readout mu: 1
 - EMA half-life: about 2.21e5 processed tokens
 - shrink half-lives:

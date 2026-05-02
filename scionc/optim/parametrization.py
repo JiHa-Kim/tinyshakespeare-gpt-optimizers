@@ -2,13 +2,13 @@ import math
 from dataclasses import dataclass
 
 __all__ = [
+    "InvariantAction",
     "RMSCorrection",
-    "ScheduledAction",
-    "additive_eta",
-    "eta_unit",
     "halving_factor",
     "invariant_eta_unit",
-    "scheduled_action",
+    "rms_additive_eta",
+    "rms_eta_unit",
+    "scheduled_invariant_action",
     "scheduled_ratio",
     "scheduled_shrink",
     "resolve_schedule",
@@ -32,7 +32,7 @@ class RMSCorrection:
 
 
 @dataclass(frozen=True, slots=True)
-class ScheduledAction:
+class InvariantAction:
     shrink: float
     eta_unit: float
     eta: float
@@ -68,6 +68,7 @@ def schedule_at_step(
     warmup_steps: int,
     decay_steps: int,
 ) -> float:
+    """Return the per-update schedule value for a piecewise-constant update."""
     warmup_steps, stable_steps, decay_steps = resolve_schedule(
         max_steps, warmup_steps, decay_steps
     )
@@ -111,23 +112,23 @@ def scheduled_shrink(peak_shrink: float, ratio: float, name: str = "shrink") -> 
 
 def invariant_eta_unit(rho: float, shrink: float) -> float:
     if rho <= 0.0:
-        raise ValueError(f"invalid steady radius: {rho}")
+        raise ValueError(f"invalid reference radius: {rho}")
     if not (0.0 < shrink <= 1.0):
         raise ValueError(f"invalid shrink: {shrink}")
     return (1.0 - shrink) * rho
 
 
-def scheduled_action(
+def scheduled_invariant_action(
     rho: float,
     peak_shrink: float,
     peak_scale: float,
     scheduled_scale: float,
     name: str = "group",
-) -> ScheduledAction:
+) -> InvariantAction:
     ratio = scheduled_ratio(scheduled_scale, peak_scale, name)
     shrink = scheduled_shrink(peak_shrink, ratio, name)
     eta_unit = invariant_eta_unit(rho, shrink)
-    return ScheduledAction(
+    return InvariantAction(
         shrink=shrink,
         eta_unit=eta_unit,
         eta=peak_scale * eta_unit,
@@ -135,14 +136,14 @@ def scheduled_action(
     )
 
 
-def eta_unit(
+def rms_eta_unit(
     rho: float,
     shrink: float,
     correction: RMSCorrection,
     eps: float = 1e-12,
 ) -> float:
     if rho <= 0.0:
-        raise ValueError(f"invalid steady radius: {rho}")
+        raise ValueError(f"invalid RMS radius: {rho}")
     if not (0.0 < shrink < 1.0):
         raise ValueError(
             f"cannot derive additive eta from shrink={shrink}; "
@@ -157,11 +158,11 @@ def eta_unit(
     return rho * math.sqrt(variance)
 
 
-def additive_eta(
+def rms_additive_eta(
     rho: float,
     shrink: float,
     step_scale: float,
     correction: RMSCorrection,
     eps: float = 1e-12,
 ) -> float:
-    return step_scale * eta_unit(rho, shrink, correction, eps)
+    return step_scale * rms_eta_unit(rho, shrink, correction, eps)

@@ -23,7 +23,7 @@ from scionc.optim import ScionC
 from scionc.optim.parametrization import (
     halving_factor,
     resolve_schedule,
-    scheduled_action,
+    scheduled_invariant_action,
     schedule_at_step,
 )
 from scionc.models import (
@@ -52,7 +52,7 @@ from scionc.probes.optimizer_stats import (
     consume_step_stats,
 )
 
-DEFAULT_STEADY_RADII = {
+DEFAULT_REFERENCE_RADII = {
     "embed": 1.0,
     "hidden": 3.0,
     "out": 10.0,
@@ -64,7 +64,7 @@ DEFAULT_BETA_HALF_LIFE = -DEFAULT_COUNT_INCREMENT / math.log2(DEFAULT_REFERENCE_
 DEFAULT_SHRINK_HALF_LIVES = {
     name: -DEFAULT_COUNT_INCREMENT
     / math.log2(1.0 - DEFAULT_REFERENCE_ETA / rho)
-    for name, rho in DEFAULT_STEADY_RADII.items()
+    for name, rho in DEFAULT_REFERENCE_RADII.items()
 }
 DEFAULT_STEP_SCALE = 1.0
 
@@ -200,9 +200,9 @@ def resolve_group_rho(args, group: str) -> float:
     if rho is None:
         rho = args.rho
     if rho is None:
-        rho = DEFAULT_STEADY_RADII[group]
+        rho = DEFAULT_REFERENCE_RADII[group]
     if rho <= 0.0:
-        raise ValueError(f"invalid {group} steady radius: {rho}")
+        raise ValueError(f"invalid {group} reference radius: {rho}")
     return rho
 
 
@@ -235,7 +235,7 @@ def apply_auto_group_step_scales(
         group["auto_l1"] = l1
 
         eta = args.auto_action_scale / l1
-        unit = scheduled_action(
+        unit = scheduled_invariant_action(
             float(group["rho"]),
             float(group["peak_shrink"]),
             1.0,
@@ -295,7 +295,7 @@ def hidden_params(model: GPT) -> list[torch.Tensor]:
 
 
 def group_action(group: dict, scheduled_step_scale: float):
-    return scheduled_action(
+    return scheduled_invariant_action(
         rho=float(group["rho"]),
         peak_shrink=float(group["peak_shrink"]),
         peak_scale=float(group["peak_step_scale"]),
@@ -343,7 +343,7 @@ def action_group_fields(name: str, args, delta_tau: int) -> dict:
         "beta_half_life": args.beta_half_life,
         "count_increment": delta_tau,
     }
-    action = scheduled_action(
+    action = scheduled_invariant_action(
         fields["rho"],
         peak_shrink,
         peak_step_scale,
@@ -422,7 +422,7 @@ def configure_optimizer_actions(opt, args) -> None:
     memory_beta = halving_factor(delta_tau, args.beta_half_life, "beta_half_life")
     for group in opt.param_groups:
         name = group.get("name")
-        if name not in DEFAULT_STEADY_RADII:
+        if name not in DEFAULT_REFERENCE_RADII:
             continue
         group.update(
             action_group_fields(name, args, delta_tau),
@@ -1304,7 +1304,7 @@ def make_parser():
         "--rho",
         type=float,
         default=None,
-        help="steady-state radius for all optimizer groups",
+        help="reference radius for all optimizer groups",
     )
     p.add_argument("--rho-embed", dest="rho_embed", type=float, default=None)
     p.add_argument("--rho-hidden", dest="rho_hidden", type=float, default=None)

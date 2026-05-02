@@ -1,4 +1,4 @@
-# ScionC Steady-State Parametrization
+# ScionC Reference-Radius Parametrization
 
 This note documents the active ScionC coordinates used by
 `scionc/train_shakespeare.py`. The goal is to make the optimizer settings
@@ -6,7 +6,7 @@ transfer cleanly when batch size, block size, or gradient accumulation change.
 
 The main design choice is to expose semantic coordinates:
 
-- a target radius for each ULMO geometry,
+- a reference radius for each ULMO geometry,
 - token half-lives for EMA memory and direct shrinkage,
 - a dimensionless peak step scale,
 - and a schedule ratio for the shrink rate.
@@ -75,10 +75,10 @@ current gradient, and then forms the readout above.
 
 ## Scheduled Shrink Rate
 
-The training schedule produces a nonnegative ratio $r_t$. In the WSD setup,
-$r_t=1$ during the stable peak and decays to the configured floor during the
-tail. The code obtains $r_t$ by scheduling the dimensionless step-scale value
-and dividing by the peak step scale.
+The training schedule produces a nonnegative per-update ratio $r_t$. In the WSD
+setup, $r_t=1$ during the stable peak and decays to the configured floor during
+the tail. The code obtains $r_t$ by scheduling the dimensionless step-scale
+value and dividing by the peak step scale.
 
 The active recipe schedules the continuous shrink rate:
 
@@ -90,13 +90,24 @@ The active recipe schedules the continuous shrink rate:
 2^{-r_t\Delta\tau/h_\zeta}.
 ```
 
-This keeps the half-life semantics exact. When $r_t\to0$, the per-step shrink
-factor tends to one and the shrink action turns off.
+Equivalently, the exact continuous-rate expression is:
+
+```math
+\zeta_t
+=
+2^{-\frac{1}{h_\zeta}
+\int_{\tau_t}^{\tau_t+\Delta\tau} r(s)\,ds}.
+```
+
+The discrete formula above is exact when $r_t$ is the interval average over the
+update, or when the schedule is treated as piecewise constant during each
+update. When $r_t\to0$, the per-step shrink factor tends to one and the shrink
+action turns off.
 
 ## Geometry-Invariant Step
 
 Let $\|\cdot\|$ be the primal norm declared by the group ULMO and let $\rho$ be
-the target radius. Since the ULMO atom satisfies $\|V\|\le1$:
+the reference radius. Since the ULMO atom satisfies $\|V\|\le1$:
 
 ```math
 \|X_{\mathrm{new}}\|
@@ -148,7 +159,7 @@ The default count increment is:
 16384.
 ```
 
-The default radii are:
+The default reference radii are:
 
 ```math
 \rho_{\mathrm{embed}}=1,
@@ -233,7 +244,7 @@ The additive step follows from the same radius rule:
 s_{\mathrm{peak}}(1-\zeta_{t,\star})\rho.
 ```
 
-This preserves memory time, shrink-rate time, the group radius, the
+This preserves memory time, shrink-rate time, the reference radius, the
 over-relaxation coordinate, and the schedule shape in processed-token units.
 
 ## Relation To Old LR-Coupled Numerics
@@ -330,9 +341,19 @@ s\rho
 }.
 ```
 
-This RMS rule is not the active Shakespeare ScionC parametrization. It can
-exceed the geometry-invariant persistent-direction bound because it assumes
-randomized second-moment balance, not worst-case alignment.
+This RMS rule targets a second-moment steady-state radius. The active
+reference-radius rule instead targets the persistent-direction invariant bound.
+Under the RMS model, the active rule gives:
+
+```math
+\frac{R_{\mathrm{rms}}}{\rho}
+=
+s_{\mathrm{peak}}\sqrt{C}
+\sqrt{\frac{1-\zeta}{1+\zeta}}.
+```
+
+Thus $\rho$ is not the RMS steady-state radius in the active parametrization;
+it is the geometry reference radius for the invariant action.
 
 In the small-shrink regime with $d=1-\zeta$:
 
@@ -349,7 +370,7 @@ lower-level optimizer paths.
 
 The primary CLI coordinates are:
 
-- `--rho-*`: group radius $\rho$.
+- `--rho-*`: group reference radius $\rho$.
 - `--shrink-half-life-*`: shrink half-life $h_\zeta$.
 - `--log2-step-scale*`: log coordinate $\ell_{\mathrm{peak}}$.
 - `--step-scale*`: linear compatibility coordinate $s_{\mathrm{peak}}$.
