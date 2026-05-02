@@ -56,7 +56,6 @@ _GNS_A0, _GNS_B0, _GNS_C0 = _GNS_COEFFS[0]
 _FP32_EPS = torch.finfo(torch.float32).eps
 _MOMENT4_REFINE_STEPS = 8
 _MOMENT4_FEAS_TOL = 0.25 * _FP32_EPS
-_MOMENT4_BETA_PAD = 2048.0 * _FP32_EPS
 
 
 def _gns_coeff(i: int) -> tuple[float, float, float]:
@@ -72,6 +71,11 @@ def _gns_work_dtype(x: torch.Tensor, work_dtype: torch.dtype | None) -> torch.dt
 def _moment2_beta_from_m2(m2: torch.Tensor, n: int) -> torch.Tensor:
     v = (m2 - 1.0 / n).clamp_min(0.0)
     return 1.0 / n + torch.sqrt(((n - 1.0) / n) * v)
+
+
+def _dot_roundoff_gamma(dot_dim: int) -> float:
+    dim_eps = dot_dim * _FP32_EPS
+    return dim_eps / (1.0 - dim_eps)
 
 
 def _moment2_from_gram(
@@ -190,9 +194,12 @@ def _spectral_bound_from_beta(
     beta: torch.Tensor,
     eps: float,
     safety: float,
+    dot_dim: int,
 ) -> torch.Tensor:
-    beta = (beta + _MOMENT4_BETA_PAD).clamp(eps, 1.0)
-    bound = (t1 * beta + eps * t1).mul(safety).clamp_min(eps)
+    beta = beta.clamp(eps, 1.0)
+    # Squared-norm padding: gamma_dot * tr(G), with dot_dim from the Gram dot.
+    bound = (t1 * beta + _dot_roundoff_gamma(dot_dim) * t1).mul(safety)
+    bound = bound.clamp_min(eps)
     return torch.where(active, bound, torch.ones_like(bound))
 
 
@@ -201,18 +208,20 @@ def _spectral_bound_from_gram(
     eps: float,
     safety: float,
     gram_square: torch.Tensor | None = None,
+    dot_dim: int | None = None,
 ) -> torch.Tensor:
     n = gram.size(-1)
+    dot_dim = n if dot_dim is None else dot_dim
     if gram_square is None:
         active, t1, m2 = _moment2_from_gram(gram, eps)
         beta = _moment2_beta_from_m2(m2, n).clamp(eps, 1.0)
-        return _spectral_bound_from_beta(active, t1, beta, eps, safety)
+        return _spectral_bound_from_beta(active, t1, beta, eps, safety, dot_dim)
 
     active, t1, m2, m3, m4 = _moment4_from_gram_square(gram, gram_square, eps)
     beta2 = _moment2_beta_from_m2(m2, n).clamp(eps, 1.0)
     beta4 = _moment4_upper_beta(m2, m3, m4, n, eps, beta2)
     beta = torch.minimum(beta2, beta4.to(beta2.dtype)).clamp(eps, 1.0)
-    return _spectral_bound_from_beta(active, t1, beta, eps, safety)
+    return _spectral_bound_from_beta(active, t1, beta, eps, safety, dot_dim)
 
 
 def _scale_gram_and_first_poly_eager(
@@ -222,7 +231,7 @@ def _scale_gram_and_first_poly_eager(
     eps: float,
     safety: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    bound = _spectral_bound_from_gram(gram, eps, safety, gram_square)
+    bound = _spectral_bound_from_gram(gram, eps, safety, gram_square, x.size(-1))
     x_scale = torch.rsqrt(bound).reshape(-1, 1, 1).to(x.dtype)
     scale2 = x_scale.square()
     scale4 = scale2.square()
