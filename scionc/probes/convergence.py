@@ -1,5 +1,4 @@
 import math
-from copy import copy
 from dataclasses import dataclass
 
 import torch
@@ -29,8 +28,11 @@ _SpectralPowerGroupKey = tuple[torch.device, tuple[int, int], int]
 _SpectralPowerGroupItem = tuple[_SpectralPowerKey, torch.Tensor, bool]
 _PrevState = tuple[torch.Tensor, torch.Tensor] | None
 _ConvergenceRecord = tuple[ConvergenceItem, torch.Tensor, _PrevState]
+_SpectralDualRequest = tuple[int, ConvergenceItem, torch.Tensor]
+_SpectralDualGroupKey = tuple[torch.device, tuple[int, int]]
 _STREAMING_POWER_COLD_STEPS = 4
 _STREAMING_POWER_WARM_STEPS = 1
+_NUCLEAR_SUPPORT_STEPS = 7
 
 
 class StreamingSpectralNormEstimator:
@@ -125,31 +127,12 @@ def is_spectral_ulmo(ulmo) -> bool:
     return isinstance(ulmo, GramNewtonSchulzULMO | StreamingSVDULMO)
 
 
-def spectral_support_dual(
-    x: torch.Tensor, ulmo, param: torch.Tensor | None, eps: float
-) -> float:
-    x = x.detach()
-    if isinstance(ulmo, GramNewtonSchulzULMO):
-        x32 = x.float()
-        polar = gram_newton_schulz_uvt(
-            x32, ulmo.steps, ulmo.eps, ulmo.work_dtype, ulmo.bound_safety
-        ).float()
-        return max(0.0, float((x32 * polar).sum()) * spectral_ulmo_scale(x32, ulmo))
-
-    stat_ulmo = copy(ulmo)
-    stat_ulmo.states = dict(ulmo.states)
-    stat_ulmo.stats = dict(ulmo.stats)
-    stat_ulmo._param_key = id(param) if param is not None else None
-    update = stat_ulmo(x.clone(memory_format=torch.preserve_format))
-    return max(0.0, float(-(x.float() * update.float()).sum()))
-
-
 def dual_norm(
     x: torch.Tensor, ulmo, eps: float = 1e-12, param: torch.Tensor | None = None
 ) -> float:
     x = x.float()
     if is_spectral_ulmo(ulmo):
-        return spectral_support_dual(x, ulmo, param, eps)
+        return spectral_nuclear_support_estimate(x, eps) * spectral_ulmo_scale(x, ulmo)
 
     y = oriented_matrix(x, ulmo)
     if isinstance(ulmo, SignULMO):
@@ -185,6 +168,34 @@ def spectral_norm_power(x: torch.Tensor, eps: float = 1e-12, steps: int = 4) -> 
     return float(torch.linalg.vector_norm(x @ v).clamp_min(eps))
 
 
+@torch.no_grad()
+def spectral_nuclear_support_batch(
+    batch: torch.Tensor,
+    steps: int = _NUCLEAR_SUPPORT_STEPS,
+    eps: float = 1e-7,
+    work_dtype: torch.dtype | None = torch.float16,
+) -> torch.Tensor:
+    polar = gram_newton_schulz_uvt(batch, steps, eps, work_dtype, 1.05).float()
+    return (batch.float() * polar).sum(dim=(-2, -1)).abs()
+
+
+def spectral_nuclear_support_estimate(
+    x: torch.Tensor, eps: float = 1e-12, steps: int = _NUCLEAR_SUPPORT_STEPS
+) -> float:
+    x = x.float()
+    if x.ndim != 2 or x.numel() == 0:
+        return float(torch.linalg.vector_norm(x))
+    work = x.mT if x.size(0) < x.size(1) else x
+    return float(
+        spectral_nuclear_support_batch(
+            work.unsqueeze(0),
+            steps,
+            1e-7,
+            torch.float16 if work.is_cuda else torch.float32,
+        ).clamp_min(eps)
+    )
+
+
 def primal_norm(x: torch.Tensor, ulmo, eps: float = 1e-12) -> float:
     x = x.float()
     if is_spectral_ulmo(ulmo):
@@ -204,15 +215,6 @@ def primal_norm(x: torch.Tensor, ulmo, eps: float = 1e-12) -> float:
     return float(torch.linalg.vector_norm(x).clamp_min(eps))
 
 
-def nuclear_rank(x: torch.Tensor, ulmo, eps: float = 1e-12) -> float:
-    if not is_spectral_ulmo(ulmo):
-        return float("nan")
-    x = x.float()
-    fro_sq = x.square().sum().clamp_min(eps)
-    nuc = dual_norm(x, ulmo, eps) / max(spectral_ulmo_scale(x, ulmo), eps)
-    return float((nuc * nuc) / fro_sq)
-
-
 def stable_rank_from_input(x: torch.Tensor, eps: float = 1e-12) -> float:
     flat = x.detach().reshape(-1, x.size(-1)).float()
     gram = (flat.mT @ flat).float()
@@ -227,10 +229,17 @@ class ConvergenceProbe:
         self.action_scale = args.convergence_action_scale
         self.eps = 1e-12
         self.active = False
+        self.keep_prev = False
+        self.keep_prev_gpu = False
         self.prev: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self.prev_gpu: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self.input_sr: dict[int, float] = {}
         self.summary: dict[str, dict[str, float]] = {}
         self.spectral_norms = StreamingSpectralNormEstimator(self.eps)
+        self.support_steps = max(
+            1,
+            int(getattr(args, "convergence_support_steps", _NUCLEAR_SUPPORT_STEPS)),
+        )
         self.items = self._items(model, opt, args.convergence_probe)
 
     def _items(self, model: GPT, opt, probe: str) -> list[ConvergenceItem]:
@@ -272,6 +281,10 @@ class ConvergenceProbe:
 
     def start_step(self, step: int) -> None:
         self.active = self.interval > 0 and step % self.interval == 0
+        self.keep_prev = self.active or (
+            self.interval > 0 and (step + 1) % self.interval == 0
+        )
+        self.keep_prev_gpu = self.interval > 0 and (step + 1) % self.interval == 0
         if self.active:
             self.input_sr.clear()
 
@@ -319,22 +332,88 @@ class ConvergenceProbe:
         requests: list[tuple[_SpectralPowerKey, torch.Tensor]] = []
         scales: dict[_SpectralPowerKey, float] = {}
         for item, _, previous in records:
-            if previous is None or not self._can_stream_spectral_norm(
-                item, item.param
-            ):
-                continue
-            _, prev_param = previous
-            if prev_param.shape != item.param.shape:
+            if not self._can_stream_spectral_norm(item, item.param):
                 continue
             key = (id(item.param), "dparam")
-            prev_gpu = prev_param.to(item.param.device, non_blocking=True)
-            requests.append((key, item.param.detach().float() - prev_gpu))
+            previous_gpu = self.prev_gpu.get(id(item.param))
+            if previous_gpu is not None and previous_gpu[1].shape == item.param.shape:
+                prev_param_gpu = previous_gpu[1]
+            elif previous is not None:
+                _, prev_param = previous
+                if prev_param.shape != item.param.shape:
+                    continue
+                prev_param_gpu = prev_param.to(item.param.device, non_blocking=True)
+            else:
+                continue
+            requests.append((key, item.param.detach().float() - prev_param_gpu))
             scales[key] = spectral_ulmo_scale(item.param, item.ulmo)
         estimates = self.spectral_norms.estimate(requests)
         return {
             key[0]: value / max(scales[key], self.eps)
             for key, value in estimates.items()
         }
+
+    def _spectral_grad_dual_norms(
+        self, records: list[_ConvergenceRecord]
+    ) -> dict[int, float]:
+        requests = [
+            (id(item.param), item, grad.detach())
+            for item, grad, _ in records
+            if self._can_stream_spectral_norm(item, grad)
+        ]
+        return self._spectral_dual_norms(requests)
+
+    def _spectral_dgrad_dual_norms(
+        self, records: list[_ConvergenceRecord]
+    ) -> dict[int, float]:
+        requests: list[_SpectralDualRequest] = []
+        for item, grad, previous in records:
+            if not self._can_stream_spectral_norm(item, grad):
+                continue
+            previous_gpu = self.prev_gpu.get(id(item.param))
+            if previous_gpu is not None and previous_gpu[0].shape == grad.shape:
+                prev_grad_gpu = previous_gpu[0]
+            elif previous is not None:
+                prev_grad, _ = previous
+                if prev_grad.shape != grad.shape:
+                    continue
+                prev_grad_gpu = prev_grad.to(grad.device, non_blocking=True)
+            else:
+                continue
+            requests.append(
+                (id(item.param), item, grad.detach().float() - prev_grad_gpu)
+            )
+        return self._spectral_dual_norms(requests)
+
+    def _spectral_dual_norms(
+        self, requests: list[_SpectralDualRequest]
+    ) -> dict[int, float]:
+        results: dict[int, float] = {}
+        groups: dict[_SpectralDualGroupKey, list[_SpectralDualRequest]] = {}
+        scales: dict[int, float] = {}
+
+        for key, item, x in requests:
+            work = x.detach().float()
+            if work.size(0) < work.size(1):
+                work = work.mT
+            scales[key] = spectral_ulmo_scale(x, item.ulmo)
+            groups.setdefault((work.device, tuple(work.shape)), []).append(
+                (key, item, work)
+            )
+
+        for items in groups.values():
+            batch = torch.stack([x for _, _, x in items]).contiguous()
+            trace_norm = spectral_nuclear_support_batch(
+                batch,
+                self.support_steps,
+                1e-7,
+                torch.float16 if batch.is_cuda else torch.float32,
+            )
+            for (key, _, _), value in zip(
+                items, trace_norm.detach().cpu().tolist(), strict=True
+            ):
+                results[key] = max(float(value) * scales[key], 0.0)
+        return results
 
     def _can_stream_spectral_norm(self, item: ConvergenceItem, x: torch.Tensor) -> bool:
         return (
@@ -344,10 +423,19 @@ class ConvergenceProbe:
             and x.device.type == "cuda"
         )
 
+    def _has_previous(self, item: ConvergenceItem) -> bool:
+        key = id(item.param)
+        return key in self.prev or key in self.prev_gpu
+
     def capture(self, step: int, current_etas: dict[str, float]) -> str:
         report = self.active
+        if not report and not self.keep_prev:
+            self.summary = {}
+            self.active = False
+            return ""
         if not report:
             self.summary = {}
+
         grouped: dict[str, dict[str, list[float]]] = {}
         records = []
         for item in self.items:
@@ -358,16 +446,23 @@ class ConvergenceProbe:
 
         streaming_primal = self._streaming_primal_norms(records) if report else {}
         streaming_dparam = self._streaming_dparam_norms(records) if report else {}
+        spectral_gdual = self._spectral_grad_dual_norms(records) if report else {}
+        spectral_dgrad = self._spectral_dgrad_dual_norms(records) if report else {}
 
         for item, grad, previous in records:
-            current_grad = grad.detach().float().cpu()
-            current_param = item.param.detach().float().cpu()
+            streamable = self._can_stream_spectral_norm(item, item.param)
+            current_grad = None
+            current_param = None
 
             if report:
                 stats = grouped.setdefault(item.group, {})
-                grad_dual = dual_norm(current_grad, item.ulmo, self.eps, item.param)
+                grad_dual = spectral_gdual.get(id(item.param))
+                if grad_dual is None:
+                    current_grad = grad.detach().float().cpu()
+                    grad_dual = dual_norm(current_grad, item.ulmo, self.eps, item.param)
                 param_primal = streaming_primal.get(id(item.param))
                 if param_primal is None:
+                    current_param = item.param.detach().float().cpu()
                     param_primal = primal_norm(current_param, item.ulmo, self.eps)
                 eta = current_etas.get(item.group, float("nan"))
                 self._append(stats, "gdual", grad_dual)
@@ -376,17 +471,38 @@ class ConvergenceProbe:
                 self._append(stats, "eta", eta)
                 self._append(stats, "eta_rel", eta / max(item.rho, self.eps))
 
-                if previous is not None:
-                    prev_grad, prev_param = previous
-                    dgrad = dual_norm(
-                        current_grad - prev_grad, item.ulmo, self.eps, item.param
-                    )
+                if self._has_previous(item):
+                    dgrad = spectral_dgrad.get(id(item.param))
+                    if dgrad is None:
+                        if previous is None:
+                            dgrad = None
+                        else:
+                            prev_grad, _ = previous
+                            if current_grad is None:
+                                current_grad = grad.detach().float().cpu()
+                            dgrad = dual_norm(
+                                current_grad - prev_grad,
+                                item.ulmo,
+                                self.eps,
+                                item.param,
+                            )
                     dparam = streaming_dparam.get(id(item.param))
                     if dparam is None:
-                        dparam = primal_norm(
-                            current_param - prev_param, item.ulmo, self.eps
-                        )
-                    if dparam > self.eps and grad_dual > self.eps:
+                        if previous is None:
+                            dparam = None
+                        else:
+                            _, prev_param = previous
+                            if current_param is None:
+                                current_param = item.param.detach().float().cpu()
+                            dparam = primal_norm(
+                                current_param - prev_param, item.ulmo, self.eps
+                            )
+                    if (
+                        dgrad is not None
+                        and dparam is not None
+                        and dparam > self.eps
+                        and grad_dual > self.eps
+                    ):
                         l1hat = (dgrad / dparam) / grad_dual
                         lrel = item.rho * l1hat
                         self._append(stats, "l1", l1hat)
@@ -402,12 +518,33 @@ class ConvergenceProbe:
                     and grad.ndim == 2
                     and is_spectral_ulmo(item.ulmo)
                 ):
-                    ratio = nuclear_rank(current_grad, item.ulmo, self.eps) / max(
-                        input_sr, self.eps
+                    scale = max(spectral_ulmo_scale(grad, item.ulmo), self.eps)
+                    fro_sq = float(
+                        grad.detach().float().square().sum().clamp_min(self.eps)
                     )
+                    nuc = grad_dual / scale
+                    ratio = (nuc * nuc / fro_sq) / max(input_sr, self.eps)
                     self._append(stats, "spec_ratio", ratio)
 
-            self.prev[id(item.param)] = (current_grad.clone(), current_param.clone())
+            if self.keep_prev_gpu and streamable:
+                self.prev_gpu[id(item.param)] = (
+                    grad.detach().float().clone(),
+                    item.param.detach().float().clone(),
+                )
+                self.prev.pop(id(item.param), None)
+            else:
+                self.prev_gpu.pop(id(item.param), None)
+                if self.keep_prev:
+                    if current_grad is None:
+                        current_grad = grad.detach().float().cpu()
+                    if current_param is None:
+                        current_param = item.param.detach().float().cpu()
+                    self.prev[id(item.param)] = (
+                        current_grad.clone(),
+                        current_param.clone(),
+                    )
+                else:
+                    self.prev.pop(id(item.param), None)
         self.active = False
         return self._format(step, grouped) if report else ""
 

@@ -1479,6 +1479,12 @@ def make_parser():
         help="which parameters to include in convergence probes",
     )
     p.add_argument(
+        "--convergence-support-steps",
+        type=int,
+        default=7,
+        help="Gram-NS polar-support steps for spectral dual stats",
+    )
+    p.add_argument(
         "--auto-step-scale-from-stats",
         dest="auto_step_scale_from_stats",
         action="store_true",
