@@ -52,6 +52,11 @@ _GNS_COEFFS = (
     ),
 )
 _GNS_RESETS = frozenset({2})
+_GNS_A0, _GNS_B0, _GNS_C0 = _GNS_COEFFS[0]
+_FP32_EPS = torch.finfo(torch.float32).eps
+_MOMENT4_REFINE_STEPS = 8
+_MOMENT4_FEAS_TOL = 0.25 * _FP32_EPS
+_MOMENT4_BETA_PAD = 2048.0 * _FP32_EPS
 
 
 def _gns_coeff(i: int) -> tuple[float, float, float]:
@@ -64,37 +69,168 @@ def _gns_work_dtype(x: torch.Tensor, work_dtype: torch.dtype | None) -> torch.dt
     return torch.float16 if x.is_cuda else torch.float32
 
 
-def _moment2_beta(gram: torch.Tensor, eps: float, safety: float) -> torch.Tensor:
-    n = gram.size(-1)
-    t1 = (
-        gram.diagonal(dim1=-2, dim2=-1)
-        .sum(-1, dtype=torch.float32)
-        .clamp_min(eps)
+def _moment2_beta_from_m2(m2: torch.Tensor, n: int) -> torch.Tensor:
+    v = (m2 - 1.0 / n).clamp_min(0.0)
+    return 1.0 / n + torch.sqrt(((n - 1.0) / n) * v)
+
+
+def _moment4_coupled_feasible(
+    t: torch.Tensor,
+    m2: torch.Tensor,
+    m3: torch.Tensor,
+    m4: torch.Tensor,
+    n: int,
+    tol: float,
+) -> torch.Tensor:
+    n_float = float(n)
+    t2 = t.square()
+    t3 = t2 * t
+    t4 = t2.square()
+    m2_sq = m2.square()
+    m3_sq = m3.square()
+    m2m3 = m2 * m3
+    m2m4 = m2 * m4
+    moment_gap = m2m4 - m3_sq
+
+    e0 = (m2 - t2) * (m4 - t4) - (m3 - t3).square()
+    d0 = (
+        (1.0 - n_float * m2) * t4
+        + 2.0 * (n_float * m3 - m2) * t3
+        + (3.0 * m2_sq - 2.0 * m3 - n_float * m4) * t2
+        + 2.0 * (m4 - m2m3) * t
+        + (n_float - 1.0) * moment_gap
+        - m2 * m2_sq
+        + 2.0 * m2m3
+        - m4
     )
-    r2 = gram.square().sum(dim=(-2, -1), dtype=torch.float32)
-    m2 = r2.div(t1.square()).clamp_min(1.0 / n)
-    beta = 1.0 / n + torch.sqrt(((n - 1.0) / n) * (m2 - 1.0 / n))
-    return beta.mul(safety).clamp_min(eps)
+    return torch.minimum(e0, d0) >= -tol
 
 
-def _moment2_gram_scale(
-    x: torch.Tensor, gram: torch.Tensor, eps: float, safety: float
-) -> tuple[torch.Tensor, torch.Tensor]:
-    beta = _moment2_beta(gram, eps, safety)
-    inv = torch.rsqrt(beta).reshape(-1, 1, 1)
-    inv_x = inv.to(x.dtype)
-    return gram * inv_x.square(), inv_x
+def _moment4_support_lower(
+    m2: torch.Tensor, m3: torch.Tensor, m4: torch.Tensor, eps: float
+) -> torch.Tensor:
+    q_a = (m3 - m2.square()).clamp_min(0.0)
+    q_b = m2 * m3 - m4
+    q_c = m2 * m4 - m3.square()
+    q_disc = (q_b.square() - 4.0 * q_a * q_c).clamp_min(0.0)
+    q_root = (-q_b + torch.sqrt(q_disc)) / (2.0 * q_a).clamp_min(eps)
+    linear_root = (-q_c / q_b.clamp_max(-eps)).clamp_min(0.0)
+    q_root = torch.where(q_a > eps, q_root, linear_root)
+    return torch.maximum(torch.maximum(m2, m4 / m3.clamp_min(eps)), q_root)
+
+
+def _moment4_upper_beta(
+    m2: torch.Tensor, m3: torch.Tensor, m4: torch.Tensor, n: int, eps: float
+) -> torch.Tensor:
+    beta2 = _moment2_beta_from_m2(m2, n).clamp(eps, 1.0)
+    if n <= 1:
+        return beta2
+
+    beta_m4 = torch.sqrt(torch.sqrt(m4.clamp_min(eps)))
+    c_rad = ((n - 1.0) * (n * m4 - m2.square())).clamp_min(0.0)
+    beta_c = torch.sqrt(((m2 + torch.sqrt(c_rad)) / n).clamp_min(eps))
+    hi = torch.minimum(beta2, torch.minimum(beta_m4, beta_c)).clamp(eps, 1.0)
+    lo = torch.minimum(_moment4_support_lower(m2, m3, m4, eps), hi)
+
+    # The bracket enforces the one-dimensional PSD minors; only E and det(M0)
+    # can still cut the interval.
+    for _ in range(_MOMENT4_REFINE_STEPS):
+        mid = 0.5 * (lo + hi)
+        mid_feasible = _moment4_coupled_feasible(
+            mid, m2, m3, m4, n, _MOMENT4_FEAS_TOL
+        )
+        lo = torch.where(mid_feasible, mid, lo)
+        hi = torch.where(mid_feasible, hi, mid)
+
+    return hi.clamp(eps, 1.0)
+
+
+def _spectral_bound_from_gram(
+    gram: torch.Tensor,
+    eps: float,
+    safety: float,
+    gram_square: torch.Tensor | None = None,
+) -> torch.Tensor:
+    n = gram.size(-1)
+    t1_raw = gram.diagonal(dim1=-2, dim2=-1).sum(-1, dtype=torch.float32)
+    active = t1_raw > eps
+    t1 = t1_raw.clamp_min(eps)
+    if gram_square is None:
+        r2 = gram.float().square().sum(dim=(-2, -1), dtype=torch.float32)
+    else:
+        r2 = gram_square.diagonal(dim1=-2, dim2=-1).sum(-1, dtype=torch.float32)
+
+    m2 = r2.div(t1.square()).clamp(1.0 / n, 1.0)
+    beta = _moment2_beta_from_m2(m2, n).clamp(eps, 1.0)
+
+    if gram_square is not None and n > 1:
+        t1_2 = t1.square()
+        r3 = (gram.float() * gram_square.float()).sum(
+            dim=(-2, -1), dtype=torch.float32
+        )
+        r4 = gram_square.float().square().sum(dim=(-2, -1), dtype=torch.float32)
+        m3 = r3.div(t1_2 * t1).clamp(1.0 / (n * n), 1.0)
+        m4 = r4.div(t1_2.square()).clamp(1.0 / (n * n * n), 1.0)
+        beta4 = _moment4_upper_beta(m2, m3, m4, n, eps)
+        beta = torch.minimum(beta, beta4.to(beta.dtype)).clamp(eps, 1.0)
+
+    beta = (beta + _MOMENT4_BETA_PAD).clamp(eps, 1.0)
+    bound = (t1 * beta + eps * t1).mul(safety).clamp_min(eps)
+    return torch.where(active, bound, torch.ones_like(bound))
+
+
+def _scale_gram_and_first_poly_eager(
+    x: torch.Tensor,
+    gram: torch.Tensor,
+    gram_square: torch.Tensor,
+    eps: float,
+    safety: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    bound = _spectral_bound_from_gram(gram, eps, safety, gram_square)
+    x_scale = torch.rsqrt(bound).reshape(-1, 1, 1).to(x.dtype)
+    scale2 = x_scale.square()
+    scale4 = scale2.square()
+    gram = gram * scale2
+    first_poly = _GNS_B0 * gram + _GNS_C0 * (gram_square * scale4)
+    return gram, first_poly, x_scale
+
+
+_scale_gram_and_first_poly_compiled = torch.compile(
+    _scale_gram_and_first_poly_eager, fullgraph=True, dynamic=False
+)
+
+
+def _scale_gram_and_first_poly(
+    x: torch.Tensor,
+    gram: torch.Tensor,
+    gram_square: torch.Tensor,
+    eps: float,
+    safety: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if x.is_cuda:
+        return _scale_gram_and_first_poly_compiled(x, gram, gram_square, eps, safety)
+    return _scale_gram_and_first_poly_eager(x, gram, gram_square, eps, safety)
 
 
 def _gram_newton_schulz_core(
     x: torch.Tensor, steps: int, eps: float, bound_safety: float
 ) -> torch.Tensor:
-    gram = torch.bmm(x, x.mT)
-    gram, x_scale = _moment2_gram_scale(x, gram, eps, bound_safety)
-    eye = torch.eye(gram.size(-1), dtype=x.dtype, device=x.device).expand_as(gram)
-    q = None
+    if steps <= 0:
+        return x
 
-    for i in range(steps):
+    gram = torch.bmm(x, x.mT)
+    gram_square = torch.bmm(gram, gram)
+    gram, z, x_scale = _scale_gram_and_first_poly(
+        x, gram, gram_square, eps, bound_safety
+    )
+    eye = torch.eye(gram.size(-1), dtype=x.dtype, device=x.device).expand_as(gram)
+    q = z + _GNS_A0 * eye
+
+    if steps > 1 and 1 not in _GNS_RESETS:
+        rz = torch.baddbmm(gram, gram, z, beta=_GNS_A0)
+        gram = torch.baddbmm(rz, z, rz, beta=_GNS_A0)
+
+    for i in range(1, steps):
         a, b, c = _gns_coeff(i)
         if i in _GNS_RESETS and q is not None:
             if x_scale is not None:
@@ -121,17 +257,23 @@ def _gram_newton_schulz_core(
 def _standard_newton_schulz_core(
     x: torch.Tensor, steps: int, eps: float, bound_safety: float
 ) -> torch.Tensor:
+    if steps <= 0:
+        return x
+
     gram = torch.bmm(x, x.mT)
-    gram, x_scale = _moment2_gram_scale(x, gram, eps, bound_safety)
-    for i in range(steps):
+    gram_square = torch.bmm(gram, gram)
+    gram, update, x_scale = _scale_gram_and_first_poly(
+        x, gram, gram_square, eps, bound_safety
+    )
+    x = torch.baddbmm(x, update, x, beta=_GNS_A0)
+    if x_scale is not None:
+        x = x * x_scale
+
+    for i in range(1, steps):
         a, b, c = _gns_coeff(i)
-        if i:
-            gram = torch.bmm(x, x.mT)
+        gram = torch.bmm(x, x.mT)
         update = torch.baddbmm(gram, gram, gram, beta=b, alpha=c)
         x = torch.baddbmm(x, update, x, beta=a)
-        if x_scale is not None:
-            x = x * x_scale
-            x_scale = None
     return x
 
 

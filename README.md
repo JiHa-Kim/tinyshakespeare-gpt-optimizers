@@ -109,7 +109,8 @@ Current defaults:
 five minimax Polar Express coefficient steps with an fp64-derived final
 normalization so the composed scalar map satisfies `p(1)=1`, the 1.05 safety
 factor, a Gram-space rectangular update, a reset at iteration 2, and a cheap
-two-moment spectral upper-bound normalization from the already-formed Gram.
+four-moment spectral upper-bound normalization that reuses the first `G @ G`
+product already needed by the polynomial iteration.
 
 `--hidden-ulmo streaming-svd` keeps a per-parameter cached right-singular basis
 and applies one or more streaming subspace steps per optimizer update.
