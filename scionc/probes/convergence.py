@@ -24,6 +24,84 @@ class ConvergenceItem:
     rho: float
 
 
+_SpectralPowerKey = tuple[int, str]
+_SpectralPowerGroupKey = tuple[torch.device, tuple[int, int], int]
+_SpectralPowerGroupItem = tuple[_SpectralPowerKey, torch.Tensor, bool]
+_PrevState = tuple[torch.Tensor, torch.Tensor] | None
+_ConvergenceRecord = tuple[ConvergenceItem, torch.Tensor, _PrevState]
+_STREAMING_POWER_COLD_STEPS = 4
+_STREAMING_POWER_WARM_STEPS = 1
+
+
+class StreamingSpectralNormEstimator:
+    def __init__(
+        self,
+        eps: float,
+        cold_steps: int = _STREAMING_POWER_COLD_STEPS,
+        warm_steps: int = _STREAMING_POWER_WARM_STEPS,
+    ):
+        self.eps = eps
+        self.cold_steps = cold_steps
+        self.warm_steps = warm_steps
+        self.vectors: dict[_SpectralPowerKey, torch.Tensor] = {}
+
+    @torch.no_grad()
+    def estimate(
+        self, requests: list[tuple[_SpectralPowerKey, torch.Tensor]]
+    ) -> dict[_SpectralPowerKey, float]:
+        results: dict[_SpectralPowerKey, float] = {}
+        groups: dict[_SpectralPowerGroupKey, list[_SpectralPowerGroupItem]] = {}
+
+        for key, x in requests:
+            if x.ndim != 2 or x.numel() == 0 or x.device.type != "cuda":
+                results[key] = spectral_norm_power(x, self.eps)
+                continue
+            vector = self.vectors.get(key)
+            warm = (
+                vector is not None
+                and vector.device == x.device
+                and vector.numel() == x.size(1)
+            )
+            group_key = (
+                x.device,
+                (x.size(0), x.size(1)),
+                self.warm_steps if warm else self.cold_steps,
+            )
+            groups.setdefault(group_key, []).append((key, x.detach(), warm))
+
+        for (_, _, steps), items in groups.items():
+            x_batch = torch.stack([x.float() for _, x, _ in items]).contiguous()
+            v_batch = torch.stack(
+                [
+                    self.vectors[key].to(x_batch.device, dtype=torch.float32)
+                    if warm
+                    else torch.ones(x_batch.size(2), device=x_batch.device)
+                    for key, _, warm in items
+                ]
+            ).unsqueeze(-1)
+            v_batch = self._normalize(v_batch)
+
+            for _ in range(steps):
+                u_batch = self._normalize(torch.bmm(x_batch, v_batch))
+                v_batch = self._normalize(torch.bmm(x_batch.transpose(1, 2), u_batch))
+
+            sigma = torch.linalg.vector_norm(
+                torch.bmm(x_batch, v_batch), dim=1
+            ).squeeze(-1)
+            for (key, _, _), value, vector in zip(
+                items, sigma.detach().cpu().tolist(), v_batch.squeeze(-1)
+            ):
+                results[key] = max(float(value), self.eps)
+                self.vectors[key] = vector.detach()
+
+        return results
+
+    def _normalize(self, x: torch.Tensor) -> torch.Tensor:
+        return x / torch.linalg.vector_norm(x, dim=1, keepdim=True).clamp_min(
+            self.eps
+        )
+
+
 def median(values: list[float]) -> float:
     if not values:
         return float("nan")
@@ -152,6 +230,7 @@ class ConvergenceProbe:
         self.prev: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self.input_sr: dict[int, float] = {}
         self.summary: dict[str, dict[str, float]] = {}
+        self.spectral_norms = StreamingSpectralNormEstimator(self.eps)
         self.items = self._items(model, opt, args.convergence_probe)
 
     def _items(self, model: GPT, opt, probe: str) -> list[ConvergenceItem]:
@@ -217,23 +296,79 @@ class ConvergenceProbe:
 
         return hook
 
+    def _streaming_primal_norms(
+        self, records: list[_ConvergenceRecord]
+    ) -> dict[int, float]:
+        requests: list[tuple[_SpectralPowerKey, torch.Tensor]] = []
+        scales: dict[_SpectralPowerKey, float] = {}
+        for item, _, _ in records:
+            if not self._can_stream_spectral_norm(item, item.param):
+                continue
+            key = (id(item.param), "param")
+            requests.append((key, item.param.detach()))
+            scales[key] = spectral_ulmo_scale(item.param, item.ulmo)
+        estimates = self.spectral_norms.estimate(requests)
+        return {
+            key[0]: value / max(scales[key], self.eps)
+            for key, value in estimates.items()
+        }
+
+    def _streaming_dparam_norms(
+        self, records: list[_ConvergenceRecord]
+    ) -> dict[int, float]:
+        requests: list[tuple[_SpectralPowerKey, torch.Tensor]] = []
+        scales: dict[_SpectralPowerKey, float] = {}
+        for item, _, previous in records:
+            if previous is None or not self._can_stream_spectral_norm(
+                item, item.param
+            ):
+                continue
+            _, prev_param = previous
+            if prev_param.shape != item.param.shape:
+                continue
+            key = (id(item.param), "dparam")
+            prev_gpu = prev_param.to(item.param.device, non_blocking=True)
+            requests.append((key, item.param.detach().float() - prev_gpu))
+            scales[key] = spectral_ulmo_scale(item.param, item.ulmo)
+        estimates = self.spectral_norms.estimate(requests)
+        return {
+            key[0]: value / max(scales[key], self.eps)
+            for key, value in estimates.items()
+        }
+
+    def _can_stream_spectral_norm(self, item: ConvergenceItem, x: torch.Tensor) -> bool:
+        return (
+            is_spectral_ulmo(item.ulmo)
+            and x.ndim == 2
+            and x.numel() > 0
+            and x.device.type == "cuda"
+        )
+
     def capture(self, step: int, current_etas: dict[str, float]) -> str:
         report = self.active
         if not report:
             self.summary = {}
         grouped: dict[str, dict[str, list[float]]] = {}
+        records = []
         for item in self.items:
             grad = item.param.grad
             if grad is None:
                 continue
+            records.append((item, grad, self.prev.get(id(item.param))))
+
+        streaming_primal = self._streaming_primal_norms(records) if report else {}
+        streaming_dparam = self._streaming_dparam_norms(records) if report else {}
+
+        for item, grad, previous in records:
             current_grad = grad.detach().float().cpu()
             current_param = item.param.detach().float().cpu()
-            previous = self.prev.get(id(item.param))
 
             if report:
                 stats = grouped.setdefault(item.group, {})
                 grad_dual = dual_norm(current_grad, item.ulmo, self.eps, item.param)
-                param_primal = primal_norm(current_param, item.ulmo, self.eps)
+                param_primal = streaming_primal.get(id(item.param))
+                if param_primal is None:
+                    param_primal = primal_norm(current_param, item.ulmo, self.eps)
                 eta = current_etas.get(item.group, float("nan"))
                 self._append(stats, "gdual", grad_dual)
                 self._append(stats, "grel", item.rho * grad_dual)
@@ -246,9 +381,11 @@ class ConvergenceProbe:
                     dgrad = dual_norm(
                         current_grad - prev_grad, item.ulmo, self.eps, item.param
                     )
-                    dparam = primal_norm(
-                        current_param - prev_param, item.ulmo, self.eps
-                    )
+                    dparam = streaming_dparam.get(id(item.param))
+                    if dparam is None:
+                        dparam = primal_norm(
+                            current_param - prev_param, item.ulmo, self.eps
+                        )
                     if dparam > self.eps and grad_dual > self.eps:
                         l1hat = (dgrad / dparam) / grad_dual
                         lrel = item.rho * l1hat
