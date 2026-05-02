@@ -69,10 +69,8 @@ two-moment spectral upper-bound normalization from the already-formed Gram.
 `--hidden-lmo streaming-svd` keeps a per-parameter cached right-singular basis
 and applies one or more streaming subspace steps per optimizer update.
 
-`--hidden-lmo svd-filter` adds an experimental diagonal filter:
-
-- `--filter-metric grad-sigma`: zero-hook proxy using singular values of the gradient proxy.
-- `--filter-metric full`: exact incoming activation covariance for hidden linear layers.
+`--hidden-lmo svd-filter` adds an experimental diagonal filter using the exact
+incoming activation covariance for hidden linear layers.
 
 ## Recommended Command
 

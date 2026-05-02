@@ -234,7 +234,6 @@ def build_optimizer(model: GPT, args, device: torch.device):
                 refresh_threshold=args.spi_refresh_threshold,
                 iteration=args.spi_iteration,
                 filter_ridge=args.filter_ridge,
-                filter_metric=args.filter_metric,
             )
         return StreamingSVDSpectralLMO(
             steps=args.spi_steps,
@@ -320,8 +319,6 @@ def register_hidden_cov_hooks(model: GPT, lmo):
         def hook(_module, inputs):
             if not _module.training or not torch.is_grad_enabled():
                 return
-            if not lmo.collect_covariance():
-                return
             cov, count = covariance(inputs[0])
             lmo.add_covariance(weight, cov, count)
 
@@ -330,8 +327,6 @@ def register_hidden_cov_hooks(model: GPT, lmo):
     def make_mlp_hook(module: MLP):
         def hook(_module, inputs):
             if not _module.training or not torch.is_grad_enabled():
-                return
-            if not lmo.collect_covariance():
                 return
             cov, count = covariance(inputs[0])
             lmo.add_covariance(module.gate.weight, cov, count)
@@ -342,8 +337,6 @@ def register_hidden_cov_hooks(model: GPT, lmo):
     def make_qkv_hook(module: CausalSelfAttention):
         def hook(_module, inputs):
             if not _module.training or not torch.is_grad_enabled():
-                return
-            if not lmo.collect_covariance():
                 return
             cov, count = covariance(inputs[0])
             lmo.add_covariance(module.q.weight, cov, count)
@@ -483,7 +476,7 @@ def train(args):
     )
     opt = build_optimizer(raw_model, args, device)
     cov_lmo = hidden_cov_lmo(opt)
-    if cov_lmo is not None and cov_lmo.collect_covariance():
+    if cov_lmo is not None:
         register_hidden_cov_hooks(raw_model, cov_lmo)
     conv_probe = (
         ConvergenceProbe(raw_model, opt, args)
@@ -923,12 +916,6 @@ def make_parser():
         help="streaming-SVD subspace iteration path",
     )
     p.add_argument("--filter-ridge", type=float, default=1e-3)
-    p.add_argument(
-        "--filter-metric",
-        choices=["full", "grad-sigma"],
-        default="full",
-        help="activation metric for svd-filter",
-    )
     p.add_argument("--spi-refresh-interval", type=int, default=100)
     p.add_argument("--spi-refresh-threshold", type=float, default=0.10)
     p.add_argument("--rho-embed", type=float, default=1.0)

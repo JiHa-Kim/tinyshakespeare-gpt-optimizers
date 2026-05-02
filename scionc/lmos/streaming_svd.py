@@ -302,29 +302,21 @@ class HiddenSVDFilterLMO(StreamingSVDSpectralLMO):
         "cov_accums",
         "cov_cache",
         "filter_ridge",
-        "filter_metric",
     )
 
     def __init__(
         self,
         *args,
         filter_ridge: float = 1e-3,
-        filter_metric: str = "grad-sigma",
         **kwargs,
     ):
         if filter_ridge < 0.0:
             raise ValueError(f"invalid filter_ridge: {filter_ridge}")
-        if filter_metric not in {"full", "grad-sigma"}:
-            raise ValueError(f"invalid filter_metric: {filter_metric}")
         super().__init__(*args, **kwargs)
         self.cov_accums = {}
         self.cov_cache = {}
         self.filter_ridge = filter_ridge
-        self.filter_metric = filter_metric
         self.stats.update({"filtered": 0, "missing_covs": 0, "cov_updates": 0})
-
-    def collect_covariance(self) -> bool:
-        return self.filter_metric != "grad-sigma"
 
     def add_covariance(self, p: torch.Tensor, cov: torch.Tensor, count: int) -> None:
         state = self.cov_accums.get(id(p))
@@ -356,16 +348,6 @@ class HiddenSVDFilterLMO(StreamingSVDSpectralLMO):
         q_norm = denom.mul(raw.square()).sum(dim=-1, keepdim=True).clamp_min(self.eps)
         return raw * torch.sqrt(budget / q_norm)
 
-    def _grad_sigma_mv_scale(self, sigma: torch.Tensor) -> torch.Tensor:
-        sigma2 = sigma.square()
-        denom = sigma2.clamp_min(self.eps)
-        scale = denom.mean(dim=-1, keepdim=True).abs().clamp_min(self.eps)
-        denom = denom + self.filter_ridge * scale
-        budget = denom.sum(dim=-1, keepdim=True).clamp_min(self.eps)
-        q_norm = sigma2.div(denom).sum(dim=-1, keepdim=True).clamp_min(self.eps)
-        factor = torch.sqrt(budget / q_norm).div(denom)
-        return torch.nan_to_num(factor, nan=0.0, posinf=0.0, neginf=0.0)
-
     def _output_scale(
         self,
         items: list[_SVDItem],
@@ -373,10 +355,6 @@ class HiddenSVDFilterLMO(StreamingSVDSpectralLMO):
         mv: torch.Tensor,
         sigma: torch.Tensor,
     ) -> torch.Tensor:
-        if self.filter_metric == "grad-sigma":
-            self.stats["filtered"] += len(items)
-            return self._grad_sigma_mv_scale(sigma)
-
         scales = list(sigma.reciprocal().unbind())
         groups: dict[_FilterGroupKey, list[_FilterEntry]] = {}
         for i, (_, _, p, _, transposed, _) in enumerate(items):
