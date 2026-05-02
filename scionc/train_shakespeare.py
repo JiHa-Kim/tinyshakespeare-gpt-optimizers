@@ -20,6 +20,13 @@ from scionc.ulmos import (
     init_spectral_,
 )
 from scionc.optim import ScionC, lionk_S
+from scionc.optim.parametrization import (
+    RMSCorrection,
+    additive_eta,
+    halving_factor,
+    resolve_schedule,
+    schedule_at_step,
+)
 from scionc.models import (
     GPT,
     MLP,
@@ -115,45 +122,6 @@ def amp_ctx(amp_dtype: torch.dtype | None):
     )
 
 
-def resolve_schedule(
-    max_steps: int, warmup_steps: int, decay_steps: int
-) -> tuple[int, int, int]:
-    if max_steps <= 0:
-        raise ValueError(f"invalid max_steps: {max_steps}")
-    warmup_steps = max(0, min(warmup_steps, max_steps))
-    decay_steps = max(0, min(decay_steps, max_steps - warmup_steps))
-    stable_steps = max_steps - warmup_steps - decay_steps
-    return warmup_steps, stable_steps, decay_steps
-
-
-def schedule_at_step(
-    step: int,
-    max_steps: int,
-    peak: float,
-    floor: float,
-    warmup_steps: int,
-    decay_steps: int,
-) -> float:
-    warmup_steps, stable_steps, decay_steps = resolve_schedule(
-        max_steps, warmup_steps, decay_steps
-    )
-
-    if warmup_steps > 0 and step < warmup_steps:
-        return peak * (step + 1) / warmup_steps
-
-    decay_start = warmup_steps + stable_steps
-    if decay_steps == 0 or step < decay_start:
-        return peak
-    if decay_steps == 1:
-        return floor
-
-    progress = (step - decay_start) / (decay_steps - 1)
-    progress = min(max(progress, 0.0), 1.0)
-    if peak > 0.0 and floor > 0.0:
-        return 1.0 / ((1.0 - progress) / peak + progress / floor)
-    return peak + (floor - peak) * progress
-
-
 @torch.inference_mode()
 def estimate_loss(
     model: GPT,
@@ -214,19 +182,7 @@ def count_increment(args) -> int:
     return args.batch_size * args.block_size * args.grad_accum
 
 
-def halving_factor(delta_tau: float, half_life: float, name: str) -> float:
-    if delta_tau <= 0.0:
-        raise ValueError(f"invalid count increment: {delta_tau}")
-    if half_life <= 0.0:
-        raise ValueError(f"invalid {name}: {half_life}")
-    if math.isinf(half_life):
-        return 1.0
-    return 2.0 ** (-delta_tau / half_life)
-
-
-def resolve_group_shrink_half_life(
-    args, group: str
-) -> float:
+def resolve_group_shrink_half_life(args, group: str) -> float:
     half_life = getattr(args, f"shrink_half_life_{group}", None)
     if half_life is None:
         half_life = args.shrink_half_life
@@ -251,7 +207,7 @@ def apply_auto_group_step_scales(
         group["auto_l1"] = l1
 
         eta = args.auto_action_scale / l1
-        unit = eta_unit(group)
+        unit = group_eta(group, 1.0)
         step_scale = eta / unit
         step_scale = min(
             max(step_scale, group.get("min_step_scale", 0.0)),
@@ -304,28 +260,13 @@ def hidden_params(model: GPT) -> list[torch.Tensor]:
     return [p for p in model.parameters() if p.requires_grad and id(p) not in skip]
 
 
-def eta_unit(group: dict, eps: float = 1e-12) -> float:
-    shrink = float(group["shrink"])
-    if not (0.0 < shrink < 1.0):
-        raise ValueError(
-            f"cannot derive additive eta from shrink={shrink}; "
-            "use a finite shrink half-life"
-        )
-    cu2 = float(group.get("rms_cu2", 1.0))
-    q = float(group.get("rms_q", 1.0))
-    s = float(group.get("rms_s", 1.0))
-    if cu2 <= 0.0:
-        raise ValueError(f"invalid RMS atom scale: {cu2}")
-    if q <= 0.0:
-        raise ValueError(f"invalid RMS keep fraction: {q}")
-    if s <= 0.0:
-        raise ValueError(f"invalid RMS momentum factor: {s}")
-    variance = q * max(1.0 - shrink * shrink, eps) / (cu2 * s)
-    return float(group["rho"]) * math.sqrt(variance)
-
-
-def additive_eta(group: dict, step_scale: float) -> float:
-    return step_scale * eta_unit(group)
+def group_eta(group: dict, step_scale: float) -> float:
+    return additive_eta(
+        rho=float(group["rho"]),
+        shrink=float(group["shrink"]),
+        step_scale=step_scale,
+        correction=group["rms_correction"],
+    )
 
 
 @torch.no_grad()
@@ -357,7 +298,7 @@ def optimizer_group(
     ulmo,
     args,
     delta_tau: int,
-    rms_s: float,
+    rms_correction: RMSCorrection,
 ) -> dict | None:
     if not params:
         return None
@@ -378,21 +319,19 @@ def optimizer_group(
         "shrink_half_life": shrink_half_life,
         "beta_half_life": args.beta_half_life,
         "count_increment": delta_tau,
-        "rms_cu2": 1.0,
-        "rms_q": 1.0,
-        "rms_s": rms_s,
+        "rms_correction": rms_correction,
     }
-    group["lr"] = additive_eta(group, peak_step_scale)
-    return {
-        **group,
-    }
+    group["lr"] = group_eta(group, peak_step_scale)
+    return group
 
 
 @torch.no_grad()
 def build_optimizer(model: GPT, args, device: torch.device):
     delta_tau = count_increment(args)
     memory_beta = halving_factor(delta_tau, args.beta_half_life, "beta_half_life")
-    rms_s = lionk_S(args.readout_mu, memory_beta, nesterov=True)
+    rms_correction = RMSCorrection(
+        momentum_factor=lionk_S(args.readout_mu, memory_beta, nesterov=True)
+    )
     work_dtype = torch.float16 if device.type == "cuda" else torch.float32
     groups = [
         optimizer_group(
@@ -401,7 +340,7 @@ def build_optimizer(model: GPT, args, device: torch.device):
             make_embed_ulmo(args),
             args,
             delta_tau,
-            rms_s,
+            rms_correction,
         ),
         optimizer_group(
             "hidden",
@@ -409,7 +348,7 @@ def build_optimizer(model: GPT, args, device: torch.device):
             make_hidden_ulmo(args, work_dtype),
             args,
             delta_tau,
-            rms_s,
+            rms_correction,
         ),
         optimizer_group(
             "out",
@@ -417,7 +356,7 @@ def build_optimizer(model: GPT, args, device: torch.device):
             make_out_ulmo(args),
             args,
             delta_tau,
-            rms_s,
+            rms_correction,
         ),
     ]
     groups = [group for group in groups if group is not None]
@@ -564,7 +503,7 @@ def maybe_compile(
     return model, sync_now(device) - t0
 
 
-def train(args):
+def configure_runtime(args) -> tuple[torch.device, torch.dtype | None]:
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
@@ -584,26 +523,145 @@ def train(args):
         if device.type == "cuda" and torch.cuda.is_bf16_supported()
         else None
     )
+    return device, amp_dtype
+
+
+def load_dataset(args) -> CharDataset:
+    data_path = Path(args.data_path)
+    maybe_download_tiny_shakespeare(data_path)
+    return CharDataset(data_path)
+
+
+def build_model(args, dataset: CharDataset, device: torch.device) -> GPT:
+    cfg = GPTConfig(
+        vocab_size=len(dataset.chars),
+        block_size=args.block_size,
+        n_layer=args.n_layer,
+        n_head=args.n_head,
+        d_model=args.d_model,
+        rope_base=args.rope_base,
+        prenorm=args.prenorm,
+        dropout=args.dropout,
+    )
+    return GPT(cfg).to(device)
+
+
+def resolve_training_schedule(args) -> tuple[int, int, int]:
+    warmup_steps = (
+        args.warmup_iters
+        if args.warmup_iters >= 0
+        else round(args.warmup_frac * args.max_iters)
+    )
+    decay_steps = (
+        args.decay_iters
+        if args.decay_iters >= 0
+        else round(args.decay_frac * args.max_iters)
+    )
+    return resolve_schedule(args.max_iters, warmup_steps, decay_steps)
+
+
+def format_optimizer_schedule(opt) -> str:
+    parts = []
+    for group in opt.param_groups:
+        name = group.get("name", "group")
+        peak_step_scale = group.get("peak_step_scale", group["step_scale"])
+        min_step_scale = group.get("min_step_scale", 0.0)
+        peak_eta = group_eta(group, peak_step_scale)
+        min_eta = group_eta(group, min_step_scale)
+        rho = group.get("rho", math.nan)
+        shrink = group.get("shrink", 1.0)
+        shrink_half_life = group.get("shrink_half_life", math.inf)
+        rms_s = group["rms_correction"].momentum_factor
+        parts.append(
+            f"{name}=(rho={rho:g},s={peak_step_scale:.3g}->{min_step_scale:.3g},"
+            f"eta={peak_eta:.3e}->{min_eta:.3e},h_shrink={shrink_half_life:.3g},"
+            f"zeta={shrink:.6f},S={rms_s:.3g})"
+        )
+    return ", ".join(parts)
+
+
+def apply_scheduled_etas(
+    opt, step: int, max_steps: int, warmup_steps: int, decay_steps: int
+) -> dict[str, float]:
+    current_etas = {}
+    for group in opt.param_groups:
+        peak_step_scale = group.get("peak_step_scale", group["step_scale"])
+        min_step_scale = group.get("min_step_scale", 0.0)
+        step_scale = schedule_at_step(
+            step,
+            max_steps,
+            peak_step_scale,
+            min_step_scale,
+            warmup_steps,
+            decay_steps,
+        )
+        group["step_scale"] = step_scale
+        eta = group_eta(group, step_scale)
+        group["lr"] = eta
+        current_etas[group.get("name", f"group{len(current_etas)}")] = eta
+    return current_etas
+
+
+def line_probe_active(args, step: int) -> bool:
+    return (
+        args.track_line_probe
+        and args.grad_accum == 1
+        and args.line_probe_interval > 0
+        and step % args.line_probe_interval == 0
+    )
+
+
+def run_line_probe(
+    model,
+    step: int,
+    batch,
+    rng_before,
+    loss_before: float | None,
+    params_before,
+    curve_scales: list[float],
+    line_stats: dict[str, dict],
+    amp_dtype: torch.dtype | None,
+    device: torch.device,
+) -> None:
+    if batch is None or rng_before is None or loss_before is None:
+        return
+
+    rng_after = capture_rng(device)
+    if params_before is None:
+        restore_rng(rng_before, device)
+        with torch.no_grad(), amp_ctx(amp_dtype):
+            _, loss_after = model(*batch)
+        restore_rng(rng_after, device)
+        loss_after_value = float(loss_after.detach())
+    else:
+        snapshot = finish_line_snapshot(params_before)
+        curve_losses = []
+        for scale in curve_scales:
+            apply_line_scale(snapshot, scale)
+            restore_rng(rng_before, device)
+            with torch.no_grad(), amp_ctx(amp_dtype):
+                _, curve_loss = model(*batch)
+            curve_losses.append((scale, float(curve_loss.detach())))
+        apply_line_scale(snapshot, 1.0)
+        restore_rng(rng_after, device)
+        loss_after_value = min(curve_losses, key=lambda item: abs(item[0] - 1.0))[1]
+        curve_text = line_curve_text(step, curve_losses)
+        if curve_text:
+            print(curve_text)
+
+    line_text = line_probe_text(step, loss_before, loss_after_value, line_stats)
+    if line_text:
+        print(line_text)
+
+
+def train(args):
+    device, amp_dtype = configure_runtime(args)
     line_curve_scales = parse_line_scales(args.line_curve_scales)
     if line_curve_scales:
         args.track_line_probe = True
 
-    data_path = Path(args.data_path)
-    maybe_download_tiny_shakespeare(data_path)
-    dataset = CharDataset(data_path)
-
-    raw_model = GPT(
-        GPTConfig(
-            vocab_size=len(dataset.chars),
-            block_size=args.block_size,
-            n_layer=args.n_layer,
-            n_head=args.n_head,
-            d_model=args.d_model,
-            rope_base=args.rope_base,
-            prenorm=args.prenorm,
-            dropout=args.dropout,
-        )
-    ).to(device)
+    dataset = load_dataset(args)
+    raw_model = build_model(args, dataset, device)
     source = BatchSource(
         dataset.train, dataset.val, args.block_size, args.batch_size, device
     )
@@ -627,41 +685,13 @@ def train(args):
     if compile_seconds:
         print(f"compile_seconds {compile_seconds:.3f}")
 
-    warmup_steps = (
-        args.warmup_iters
-        if args.warmup_iters >= 0
-        else round(args.warmup_frac * args.max_iters)
-    )
-    decay_steps = (
-        args.decay_iters
-        if args.decay_iters >= 0
-        else round(args.decay_frac * args.max_iters)
-    )
-    warmup_steps, stable_steps, decay_steps = resolve_schedule(
-        args.max_iters, warmup_steps, decay_steps
-    )
+    warmup_steps, stable_steps, decay_steps = resolve_training_schedule(args)
     effective_tokens = count_increment(args)
     first_group = opt.param_groups[0]
     readout_mu = first_group.get("readout_mu", args.readout_mu)
     memory_beta = first_group.get("memory_beta", math.nan)
     beta_half_life = first_group.get("beta_half_life", math.nan)
 
-    group_schedule = []
-    for group in opt.param_groups:
-        name = group.get("name", "group")
-        peak_step_scale = group.get("peak_step_scale", group["step_scale"])
-        min_step_scale = group.get("min_step_scale", 0.0)
-        peak_eta = additive_eta(group, peak_step_scale)
-        min_eta = additive_eta(group, min_step_scale)
-        rho = group.get("rho", math.nan)
-        shrink = group.get("shrink", 1.0)
-        shrink_half_life = group.get("shrink_half_life", math.inf)
-        rms_s = group.get("rms_s", math.nan)
-        group_schedule.append(
-            f"{name}=(rho={rho:g},s={peak_step_scale:.3g}->{min_step_scale:.3g},"
-            f"eta={peak_eta:.3e}->{min_eta:.3e},h_shrink={shrink_half_life:.3g},"
-            f"zeta={shrink:.6f},S={rms_s:.3g})"
-        )
     print(
         "schedule "
         f"warmup_steps={warmup_steps} stable_steps={stable_steps} decay_steps={decay_steps} "
@@ -672,7 +702,7 @@ def train(args):
         f"hidden_ulmo={args.hidden_ulmo} "
         f"embed_ulmo={args.embed_ulmo} out_ulmo={args.out_ulmo} "
         f"qkv=split spi_iteration={args.spi_iteration} "
-        f"eta_groups=" + ", ".join(group_schedule)
+        f"eta_groups={format_optimizer_schedule(opt)}"
     )
     if args.track_line_probe and args.grad_accum != 1:
         print("line_probe_disabled_requires_grad_accum_1")
@@ -690,22 +720,9 @@ def train(args):
     step_stat_accum = {}
 
     for step in range(args.max_iters):
-        current_etas = {}
-        for group in opt.param_groups:
-            peak_step_scale = group.get("peak_step_scale", group["step_scale"])
-            min_step_scale = group.get("min_step_scale", 0.0)
-            step_scale = schedule_at_step(
-                step,
-                args.max_iters,
-                peak_step_scale,
-                min_step_scale,
-                warmup_steps,
-                decay_steps,
-            )
-            group["step_scale"] = step_scale
-            eta = additive_eta(group, step_scale)
-            group["lr"] = eta
-            current_etas[group.get("name", f"group{len(current_etas)}")] = eta
+        current_etas = apply_scheduled_etas(
+            opt, step, args.max_iters, warmup_steps, decay_steps
+        )
         eta = current_etas.get("hidden", next(iter(current_etas.values())))
 
         if step % args.eval_interval == 0 or step == args.max_iters - 1:
@@ -764,12 +781,7 @@ def train(args):
             print(f"diverged {diverge_reason}")
             break
 
-        line_active = (
-            args.track_line_probe
-            and args.grad_accum == 1
-            and args.line_probe_interval > 0
-            and step % args.line_probe_interval == 0
-        )
+        line_active = line_probe_active(args, step)
         line_batch = None
         line_rng_before = None
         line_loss_before = None
@@ -833,41 +845,19 @@ def train(args):
                 accumulate_step_stats(line_stat_accum, stat_snapshot)
                 line_stats = consume_step_stats(line_stat_accum)
         total_opt_steps = step + 1
-        if (
-            line_active
-            and line_batch is not None
-            and line_rng_before is not None
-            and line_loss_before is not None
-        ):
-            rng_after = capture_rng(device)
-            if line_params_before is None:
-                restore_rng(line_rng_before, device)
-                with torch.no_grad(), amp_ctx(amp_dtype):
-                    _, loss_after = model(*line_batch)
-                restore_rng(rng_after, device)
-                loss_after_value = float(loss_after.detach())
-            else:
-                snapshot = finish_line_snapshot(line_params_before)
-                curve_losses = []
-                for scale in line_curve_scales:
-                    apply_line_scale(snapshot, scale)
-                    restore_rng(line_rng_before, device)
-                    with torch.no_grad(), amp_ctx(amp_dtype):
-                        _, curve_loss = model(*line_batch)
-                    curve_losses.append((scale, float(curve_loss.detach())))
-                apply_line_scale(snapshot, 1.0)
-                restore_rng(rng_after, device)
-                loss_after_value = min(
-                    curve_losses, key=lambda item: abs(item[0] - 1.0)
-                )[1]
-                curve_text = line_curve_text(step, curve_losses)
-                if curve_text:
-                    print(curve_text)
-            line_text = line_probe_text(
-                step, line_loss_before, loss_after_value, line_stats
+        if line_active:
+            run_line_probe(
+                model,
+                step,
+                line_batch,
+                line_rng_before,
+                line_loss_before,
+                line_params_before,
+                line_curve_scales,
+                line_stats,
+                amp_dtype,
+                device,
             )
-            if line_text:
-                print(line_text)
 
     if not (args.skip_sample or diverged):
         y = raw_model.generate(
