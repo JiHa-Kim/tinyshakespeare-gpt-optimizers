@@ -3,23 +3,21 @@ import math
 import torch
 import torch.nn as nn
 
-from scionc.lmos.streaming_svd import HiddenSVDFilterLMO, StreamingSVDSpectralLMO
-from scionc.optim.lionk import LionKCCWDPA
+from scionc.ulmos.streaming_svd import HiddenSVDFilterULMO, StreamingSVDULMO
 
 __all__ = [
-    "ColNormLMO",
-    "RowNormLMO",
-    "GramNewtonSchulzLMO",
-    "SpectralLMO",
-    "StreamingSVDSpectralLMO",
-    "HiddenSVDFilterLMO",
-    "SignLMO",
+    "ColNormULMO",
+    "RowNormULMO",
+    "GramNewtonSchulzULMO",
+    "SpectralULMO",
+    "StreamingSVDULMO",
+    "HiddenSVDFilterULMO",
+    "SignULMO",
     "init_colnorm_",
     "init_rownorm_",
     "init_spectral_",
     "init_sign_",
     "init_semiorthogonal_",
-    "ScionC",
 ]
 
 
@@ -170,7 +168,7 @@ def gram_newton_schulz_uvt(
     return x.reshape(original_shape)
 
 
-class ColNormLMO:
+class ColNormULMO:
     __slots__ = ("eps", "transpose")
 
     def __init__(
@@ -187,7 +185,7 @@ class ColNormLMO:
         return x.mT if self.transpose else x
 
 
-class RowNormLMO:
+class RowNormULMO:
     __slots__ = ("eps", "transpose")
 
     def __init__(
@@ -204,7 +202,7 @@ class RowNormLMO:
         return x.mT if self.transpose else x
 
 
-class SignLMO:
+class SignULMO:
     __slots__ = ("transpose",)
 
     def __init__(self, transpose: bool = False):
@@ -216,7 +214,7 @@ class SignLMO:
         return x.mT if self.transpose else x
 
 
-class GramNewtonSchulzLMO:
+class GramNewtonSchulzULMO:
     __slots__ = ("steps", "eps", "work_dtype", "input_like", "bound_safety")
 
     def __init__(
@@ -239,7 +237,7 @@ class GramNewtonSchulzLMO:
 
     def __call__(self, v: torch.Tensor) -> torch.Tensor:
         if v.ndim != 2:
-            raise ValueError("GramNewtonSchulzLMO expects a 2D tensor")
+            raise ValueError("GramNewtonSchulzULMO expects a 2D tensor")
         return gram_newton_schulz_uvt(
             v, self.steps, self.eps, self.work_dtype, self.bound_safety
         ).mul_(-self._scale(v))
@@ -269,11 +267,11 @@ class GramNewtonSchulzLMO:
                 out[i] = y_batch[j].mul_(-self._scale(x))
 
         if any(x is None for x in out):
-            raise RuntimeError("batched GramNewtonSchulzLMO missed an output")
+            raise RuntimeError("batched GramNewtonSchulzULMO missed an output")
         return out
 
 
-SpectralLMO = GramNewtonSchulzLMO
+SpectralULMO = GramNewtonSchulzULMO
 
 
 @torch.no_grad()
@@ -337,24 +335,4 @@ def init_semiorthogonal_(
     w: torch.Tensor, radius: float = 1.0, input_like: bool = False
 ) -> torch.Tensor:
     return init_spectral_(w, radius=radius, input_like=input_like)
-
-
-class ScionC(LionKCCWDPA):
-    def __init__(
-        self,
-        params,
-        lr: float = 1e-4,
-        readout_mu: float = 1.0,
-        memory_beta: float = 0.95,
-        dir_fn=None,
-        eps: float = 1e-12,
-    ):
-        super().__init__(
-            params=params,
-            lr=lr,
-            betas=(readout_mu, memory_beta),
-            dir_fn=dir_fn,
-            nesterov=True,
-            eps=eps,
-        )
 

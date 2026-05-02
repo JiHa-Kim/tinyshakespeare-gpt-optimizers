@@ -18,12 +18,12 @@ def _normalize_columns(x: torch.Tensor, eps: float) -> tuple[torch.Tensor, torch
     return x * inv_scale, inv_scale
 
 
-class StreamingSVDSpectralLMO:
+class StreamingSVDULMO:
     """
-    Spectral LMO based on one or more streaming power-iteration steps.
+    Spectral ULMO based on one or more streaming power-iteration steps.
 
     The cached V basis is stored per parameter via `set_param`, which is called
-    by LionKCCWDPA when the LMO exposes that hook.
+    by optimizers when the ULMO exposes that hook.
     """
 
     __slots__ = (
@@ -252,12 +252,12 @@ class StreamingSVDSpectralLMO:
                 self.stats["calls"] += 1
 
         if any(x is None for x in out):
-            raise RuntimeError("batched StreamingSVDSpectralLMO missed an output")
+            raise RuntimeError("batched StreamingSVDULMO missed an output")
         return out
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         if x.ndim != 2:
-            raise ValueError("StreamingSVDSpectralLMO expects a 2D tensor")
+            raise ValueError("StreamingSVDULMO expects a 2D tensor")
 
         scale = math.sqrt(x.size(0) / x.size(1))
         if self.input_like:
@@ -292,7 +292,7 @@ class StreamingSVDSpectralLMO:
         return out.to(dtype=x.dtype).mul_(-scale)
 
 
-class HiddenSVDFilterLMO(StreamingSVDSpectralLMO):
+class HiddenSVDFilterULMO(StreamingSVDULMO):
     """
     Streaming-SVD hidden update with the closed-form diagonal filter for
     q(D)=tr(D A D^T), where A is the incoming activation covariance.

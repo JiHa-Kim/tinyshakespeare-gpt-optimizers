@@ -7,18 +7,19 @@ from pathlib import Path
 
 import torch
 
-from scionc.lmos import (
-    ColNormLMO,
-    GramNewtonSchulzLMO,
-    HiddenSVDFilterLMO,
-    RowNormLMO,
-    ScionC,
-    SignLMO,
-    StreamingSVDSpectralLMO,
+from scionc.ulmos import (
+    ColNormULMO,
+    GramNewtonSchulzULMO,
+    HiddenSVDFilterULMO,
+    RowNormULMO,
+    SignULMO,
+    StreamingSVDULMO,
     init_colnorm_,
+    init_rownorm_,
     init_sign_,
     init_spectral_,
 )
+from scionc.optim import ScionC, lionk_S
 from scionc.models import (
     GPT,
     MLP,
@@ -50,6 +51,11 @@ DEFAULT_SHRINK_HALF_LIVES = {
     "embed": 318_760.11959306244,
     "hidden": 967_726.9243144159,
     "out": 3_239_039.393395033,
+}
+DEFAULT_STEADY_RADII = {
+    "embed": 1.0,
+    "hidden": 3.0,
+    "out": 10.0,
 }
 
 
@@ -120,11 +126,11 @@ def resolve_schedule(
     return warmup_steps, stable_steps, decay_steps
 
 
-def lr_at_step(
+def schedule_at_step(
     step: int,
     max_steps: int,
-    lr: float,
-    min_lr: float,
+    peak: float,
+    floor: float,
     warmup_steps: int,
     decay_steps: int,
 ) -> float:
@@ -133,19 +139,19 @@ def lr_at_step(
     )
 
     if warmup_steps > 0 and step < warmup_steps:
-        return lr * (step + 1) / warmup_steps
+        return peak * (step + 1) / warmup_steps
 
     decay_start = warmup_steps + stable_steps
     if decay_steps == 0 or step < decay_start:
-        return lr
+        return peak
     if decay_steps == 1:
-        return min_lr
+        return floor
 
     progress = (step - decay_start) / (decay_steps - 1)
     progress = min(max(progress, 0.0), 1.0)
-    if lr > 0.0 and min_lr > 0.0:
-        return 1.0 / ((1.0 - progress) / lr + progress / min_lr)
-    return lr + (min_lr - lr) * progress
+    if peak > 0.0 and floor > 0.0:
+        return 1.0 / ((1.0 - progress) / peak + progress / floor)
+    return peak + (floor - peak) * progress
 
 
 @torch.inference_mode()
@@ -177,30 +183,31 @@ def estimate_val_loss(
     return estimate_loss(model, source, eval_iters, amp_dtype, splits=("val",))["val"]
 
 
-@torch.no_grad()
-def init_gpt_scion_(model: GPT, args):
-    init_colnorm_(model.tok_emb.weight, radius=args.rho_embed, transpose=True)
-    for block in model.blocks:
-        init_spectral_(block.attn.q.weight, radius=args.rho_hidden)
-        init_spectral_(block.attn.k.weight, radius=args.rho_hidden)
-        init_spectral_(block.attn.v.weight, radius=args.rho_hidden)
-        init_spectral_(block.attn.proj.weight, radius=args.rho_hidden)
-        init_spectral_(block.mlp.gate.weight, radius=args.rho_hidden)
-        init_spectral_(block.mlp.up.weight, radius=args.rho_hidden)
-        init_spectral_(block.mlp.down.weight, radius=args.rho_hidden)
-    init_sign_(model.lm_head.weight, radius=args.rho_out)
-
-
-def resolve_group_lr(args, group: str) -> tuple[float, float]:
-    peak = getattr(args, f"lr_{group}", None)
+def resolve_group_step_scale(args, group: str) -> tuple[float, float]:
+    peak = getattr(args, f"step_scale_{group}", None)
     if peak is None:
-        peak = args.lr
-    min_lr = getattr(args, f"min_lr_{group}", None)
-    if min_lr is None:
-        min_lr = args.min_lr
-    if min_lr is None:
-        min_lr = 0.1 * peak
-    return peak, min_lr
+        peak = args.step_scale
+    floor = getattr(args, f"min_step_scale_{group}", None)
+    if floor is None:
+        floor = args.min_step_scale
+    if floor is None:
+        floor = 0.1 * peak
+    if peak < 0.0:
+        raise ValueError(f"invalid {group} step scale: {peak}")
+    if floor < 0.0:
+        raise ValueError(f"invalid {group} minimum step scale: {floor}")
+    return peak, floor
+
+
+def resolve_group_rho(args, group: str) -> float:
+    rho = getattr(args, f"rho_{group}", None)
+    if rho is None:
+        rho = args.rho
+    if rho is None:
+        rho = DEFAULT_STEADY_RADII[group]
+    if rho <= 0.0:
+        raise ValueError(f"invalid {group} steady radius: {rho}")
+    return rho
 
 
 def count_increment(args) -> int:
@@ -230,7 +237,9 @@ def resolve_group_shrink_half_life(
     return half_life
 
 
-def apply_auto_group_lrs(opt, summary: dict[str, dict[str, float]], args) -> str:
+def apply_auto_group_step_scales(
+    opt, summary: dict[str, dict[str, float]], args
+) -> str:
     parts = []
     for group in opt.param_groups:
         name = group.get("name", "group")
@@ -238,122 +247,203 @@ def apply_auto_group_lrs(opt, summary: dict[str, dict[str, float]], args) -> str
         if l1 is None or not math.isfinite(l1) or l1 <= 0.0:
             continue
         old = group.get("auto_l1", l1)
-        l1 = args.auto_lr_beta * old + (1.0 - args.auto_lr_beta) * l1
+        l1 = args.auto_l1_beta * old + (1.0 - args.auto_l1_beta) * l1
         group["auto_l1"] = l1
 
-        lr = args.auto_lr_alpha / l1
-        lr = min(max(lr, group.get("min_lr", 0.0)), group.get("max_lr", lr))
-        group["peak_lr"] = lr
-        parts.append(f"{name}={lr:.3e}")
-    return "auto_lr " + ", ".join(parts) if parts else ""
+        eta = args.auto_action_scale / l1
+        unit = eta_unit(group)
+        step_scale = eta / unit
+        step_scale = min(
+            max(step_scale, group.get("min_step_scale", 0.0)),
+            group.get("max_step_scale", step_scale),
+        )
+        group["peak_step_scale"] = step_scale
+        parts.append(f"{name}={step_scale:.3e}")
+    return "auto_step_scale " + ", ".join(parts) if parts else ""
 
 
-@torch.no_grad()
-def build_optimizer(model: GPT, args, device: torch.device):
-    gns_dtype = torch.float16 if device.type == "cuda" else torch.float32
-    delta_tau = count_increment(args)
-    beta_half_life = args.beta_half_life
-    memory_beta = halving_factor(delta_tau, beta_half_life, "beta_half_life")
-    skip = {id(model.tok_emb.weight), id(model.lm_head.weight)}
-    hidden = [p for p in model.parameters() if p.requires_grad and id(p) not in skip]
-    groups = []
-
-    def hidden_lmo():
-        if args.hidden_lmo == "gram-ns":
-            return GramNewtonSchulzLMO(
-                steps=args.pe_steps, work_dtype=gns_dtype
-            )
-        if args.hidden_lmo == "svd-filter":
-            return HiddenSVDFilterLMO(
-                steps=args.spi_steps,
-                ridge=args.spi_ridge,
-                refresh_interval=args.spi_refresh_interval,
-                refresh_threshold=args.spi_refresh_threshold,
-                iteration=args.spi_iteration,
-                filter_ridge=args.filter_ridge,
-            )
-        return StreamingSVDSpectralLMO(
+def make_hidden_ulmo(args, work_dtype: torch.dtype):
+    if args.hidden_ulmo == "gram-ns":
+        return GramNewtonSchulzULMO(steps=args.pe_steps, work_dtype=work_dtype)
+    if args.hidden_ulmo == "svd-filter":
+        return HiddenSVDFilterULMO(
             steps=args.spi_steps,
             ridge=args.spi_ridge,
             refresh_interval=args.spi_refresh_interval,
             refresh_threshold=args.spi_refresh_threshold,
             iteration=args.spi_iteration,
+            filter_ridge=args.filter_ridge,
         )
+    return StreamingSVDULMO(
+        steps=args.spi_steps,
+        ridge=args.spi_ridge,
+        refresh_interval=args.spi_refresh_interval,
+        refresh_threshold=args.spi_refresh_threshold,
+        iteration=args.spi_iteration,
+    )
 
-    def embed_lmo():
-        if args.embed_lmo == "sign":
-            return SignLMO()
-        if args.embed_lmo == "rownorm":
-            return RowNormLMO()
-        return ColNormLMO(transpose=True)
 
-    def out_lmo():
-        if args.out_lmo == "colnorm":
-            return ColNormLMO(transpose=True)
-        if args.out_lmo == "rownorm":
-            return RowNormLMO()
-        return SignLMO()
+def make_embed_ulmo(args):
+    if args.embed_ulmo == "sign":
+        return SignULMO()
+    if args.embed_ulmo == "rownorm":
+        return RowNormULMO()
+    return ColNormULMO(transpose=True)
 
-    def add(name, params, dir_fn, radius):
-        if not params:
-            return
-        peak_lr, min_lr = resolve_group_lr(args, name)
-        radius = max(float(radius), 1e-12)
-        shrink_half_life = resolve_group_shrink_half_life(args, name)
-        shrink = halving_factor(
-            delta_tau, shrink_half_life, f"{name}_shrink_half_life"
+
+def make_out_ulmo(args):
+    if args.out_ulmo == "colnorm":
+        return ColNormULMO(transpose=True)
+    if args.out_ulmo == "rownorm":
+        return RowNormULMO()
+    return SignULMO()
+
+
+def hidden_params(model: GPT) -> list[torch.Tensor]:
+    skip = {id(model.tok_emb.weight), id(model.lm_head.weight)}
+    return [p for p in model.parameters() if p.requires_grad and id(p) not in skip]
+
+
+def eta_unit(group: dict, eps: float = 1e-12) -> float:
+    shrink = float(group["shrink"])
+    if not (0.0 < shrink < 1.0):
+        raise ValueError(
+            f"cannot derive additive eta from shrink={shrink}; "
+            "use a finite shrink half-life"
         )
-        group = {
-            "name": name,
-            "params": params,
-            "dir_fn": dir_fn,
-            "lr": peak_lr,
-            "peak_lr": peak_lr,
-            "max_lr": peak_lr,
-            "min_lr": min_lr,
-            "radius": radius,
-            "shrink": shrink,
-            "shrink_half_life": shrink_half_life,
-            "beta_half_life": beta_half_life,
-            "count_increment": delta_tau,
-        }
-        groups.append(group)
+    cu2 = float(group.get("rms_cu2", 1.0))
+    q = float(group.get("rms_q", 1.0))
+    s = float(group.get("rms_s", 1.0))
+    if cu2 <= 0.0:
+        raise ValueError(f"invalid RMS atom scale: {cu2}")
+    if q <= 0.0:
+        raise ValueError(f"invalid RMS keep fraction: {q}")
+    if s <= 0.0:
+        raise ValueError(f"invalid RMS momentum factor: {s}")
+    variance = q * max(1.0 - shrink * shrink, eps) / (cu2 * s)
+    return float(group["rho"]) * math.sqrt(variance)
 
-    add(
-        "embed",
-        [model.tok_emb.weight],
-        embed_lmo(),
-        args.rho_embed,
-    )
-    add(
-        "hidden",
-        hidden,
-        hidden_lmo(),
-        args.rho_hidden,
-    )
-    add("out", [model.lm_head.weight], out_lmo(), args.rho_out)
 
-    default_lr, _ = resolve_group_lr(args, "hidden")
+def additive_eta(group: dict, step_scale: float) -> float:
+    return step_scale * eta_unit(group)
+
+
+@torch.no_grad()
+def init_like_ulmo_(p: torch.Tensor, ulmo, radius: float) -> None:
+    if isinstance(ulmo, ColNormULMO):
+        init_colnorm_(p, radius=radius, transpose=ulmo.transpose)
+    elif isinstance(ulmo, RowNormULMO):
+        init_rownorm_(p, radius=radius, transpose=ulmo.transpose)
+    elif isinstance(ulmo, SignULMO):
+        init_sign_(p, radius=radius, transpose=ulmo.transpose)
+    elif isinstance(ulmo, (GramNewtonSchulzULMO, StreamingSVDULMO)):
+        init_spectral_(p, radius=radius, input_like=getattr(ulmo, "input_like", False))
+    else:
+        raise TypeError(f"unsupported ULMO init: {type(ulmo).__name__}")
+
+
+@torch.no_grad()
+def init_from_actions_(groups: list[dict]) -> None:
+    for group in groups:
+        radius = float(group["rho"])
+        ulmo = group["ulmo"]
+        for p in group["params"]:
+            init_like_ulmo_(p, ulmo, radius)
+
+
+def optimizer_group(
+    name: str,
+    params: list[torch.Tensor],
+    ulmo,
+    args,
+    delta_tau: int,
+    rms_s: float,
+) -> dict | None:
+    if not params:
+        return None
+    peak_step_scale, min_step_scale = resolve_group_step_scale(args, name)
+    rho = resolve_group_rho(args, name)
+    shrink_half_life = resolve_group_shrink_half_life(args, name)
+    shrink = halving_factor(delta_tau, shrink_half_life, f"{name}_shrink_half_life")
+    group = {
+        "name": name,
+        "params": params,
+        "ulmo": ulmo,
+        "rho": rho,
+        "step_scale": peak_step_scale,
+        "peak_step_scale": peak_step_scale,
+        "max_step_scale": peak_step_scale,
+        "min_step_scale": min_step_scale,
+        "shrink": shrink,
+        "shrink_half_life": shrink_half_life,
+        "beta_half_life": args.beta_half_life,
+        "count_increment": delta_tau,
+        "rms_cu2": 1.0,
+        "rms_q": 1.0,
+        "rms_s": rms_s,
+    }
+    group["lr"] = additive_eta(group, peak_step_scale)
+    return {
+        **group,
+    }
+
+
+@torch.no_grad()
+def build_optimizer(model: GPT, args, device: torch.device):
+    delta_tau = count_increment(args)
+    memory_beta = halving_factor(delta_tau, args.beta_half_life, "beta_half_life")
+    rms_s = lionk_S(args.readout_mu, memory_beta, nesterov=True)
+    work_dtype = torch.float16 if device.type == "cuda" else torch.float32
+    groups = [
+        optimizer_group(
+            "embed",
+            [model.tok_emb.weight],
+            make_embed_ulmo(args),
+            args,
+            delta_tau,
+            rms_s,
+        ),
+        optimizer_group(
+            "hidden",
+            hidden_params(model),
+            make_hidden_ulmo(args, work_dtype),
+            args,
+            delta_tau,
+            rms_s,
+        ),
+        optimizer_group(
+            "out",
+            [model.lm_head.weight],
+            make_out_ulmo(args),
+            args,
+            delta_tau,
+            rms_s,
+        ),
+    ]
+    groups = [group for group in groups if group is not None]
+    init_from_actions_(groups)
+
+    hidden_group = next(group for group in groups if group["name"] == "hidden")
     return ScionC(
         groups,
-        lr=default_lr,
+        lr=hidden_group["lr"],
         readout_mu=args.readout_mu,
         memory_beta=memory_beta,
     )
 
 
-def group_lmo(opt, name: str, cls):
+def group_ulmo(opt, name: str, cls):
     for group in opt.param_groups:
-        if group.get("name") == name and isinstance(group.get("dir_fn"), cls):
-            return group["dir_fn"]
+        if group.get("name") == name and isinstance(group.get("ulmo"), cls):
+            return group["ulmo"]
     return None
 
 
-def hidden_cov_lmo(opt):
-    return group_lmo(opt, "hidden", HiddenSVDFilterLMO)
+def hidden_cov_ulmo(opt):
+    return group_ulmo(opt, "hidden", HiddenSVDFilterULMO)
 
 
-def register_hidden_cov_hooks(model: GPT, lmo):
+def register_hidden_cov_hooks(model: GPT, ulmo):
     handles = []
 
     def covariance(x):
@@ -365,7 +455,7 @@ def register_hidden_cov_hooks(model: GPT, lmo):
             if not _module.training or not torch.is_grad_enabled():
                 return
             cov, count = covariance(inputs[0])
-            lmo.add_covariance(weight, cov, count)
+            ulmo.add_covariance(weight, cov, count)
 
         return hook
 
@@ -374,8 +464,8 @@ def register_hidden_cov_hooks(model: GPT, lmo):
             if not _module.training or not torch.is_grad_enabled():
                 return
             cov, count = covariance(inputs[0])
-            lmo.add_covariance(module.gate.weight, cov, count)
-            lmo.add_covariance(module.up.weight, cov, count)
+            ulmo.add_covariance(module.gate.weight, cov, count)
+            ulmo.add_covariance(module.up.weight, cov, count)
 
         return hook
 
@@ -384,9 +474,9 @@ def register_hidden_cov_hooks(model: GPT, lmo):
             if not _module.training or not torch.is_grad_enabled():
                 return
             cov, count = covariance(inputs[0])
-            lmo.add_covariance(module.q.weight, cov, count)
-            lmo.add_covariance(module.k.weight, cov, count)
-            lmo.add_covariance(module.v.weight, cov, count)
+            ulmo.add_covariance(module.q.weight, cov, count)
+            ulmo.add_covariance(module.k.weight, cov, count)
+            ulmo.add_covariance(module.v.weight, cov, count)
 
         return hook
 
@@ -514,18 +604,16 @@ def train(args):
             dropout=args.dropout,
         )
     ).to(device)
-    init_gpt_scion_(raw_model, args)
-
     source = BatchSource(
         dataset.train, dataset.val, args.block_size, args.batch_size, device
     )
     opt = build_optimizer(raw_model, args, device)
-    cov_lmo = hidden_cov_lmo(opt)
-    if cov_lmo is not None:
-        register_hidden_cov_hooks(raw_model, cov_lmo)
+    cov_ulmo = hidden_cov_ulmo(opt)
+    if cov_ulmo is not None:
+        register_hidden_cov_hooks(raw_model, cov_ulmo)
     conv_probe = (
         ConvergenceProbe(raw_model, opt, args)
-        if args.track_convergence_stats or args.auto_lr_from_stats
+        if args.track_convergence_stats or args.auto_step_scale_from_stats
         else None
     )
     if conv_probe is not None:
@@ -534,8 +622,8 @@ def train(args):
             print("compile_disabled_for_convergence_stats")
             args.compile = False
     model, compile_seconds = maybe_compile(raw_model, source, args, amp_dtype, device)
-    if cov_lmo is not None:
-        cov_lmo.cov_accums.clear()
+    if cov_ulmo is not None:
+        cov_ulmo.cov_accums.clear()
     if compile_seconds:
         print(f"compile_seconds {compile_seconds:.3f}")
 
@@ -553,22 +641,26 @@ def train(args):
         args.max_iters, warmup_steps, decay_steps
     )
     effective_tokens = count_increment(args)
-    readout_mu, memory_beta = opt.param_groups[0].get(
-        "betas", (args.readout_mu, math.nan)
-    )
-    beta_half_life = opt.param_groups[0].get("beta_half_life", math.nan)
+    first_group = opt.param_groups[0]
+    readout_mu = first_group.get("readout_mu", args.readout_mu)
+    memory_beta = first_group.get("memory_beta", math.nan)
+    beta_half_life = first_group.get("beta_half_life", math.nan)
 
     group_schedule = []
     for group in opt.param_groups:
         name = group.get("name", "group")
-        peak_lr = group.get("peak_lr", group["lr"])
-        min_lr = group.get("min_lr", args.min_lr)
-        radius = group.get("radius", 1.0)
+        peak_step_scale = group.get("peak_step_scale", group["step_scale"])
+        min_step_scale = group.get("min_step_scale", 0.0)
+        peak_eta = additive_eta(group, peak_step_scale)
+        min_eta = additive_eta(group, min_step_scale)
+        rho = group.get("rho", math.nan)
         shrink = group.get("shrink", 1.0)
         shrink_half_life = group.get("shrink_half_life", math.inf)
+        rms_s = group.get("rms_s", math.nan)
         group_schedule.append(
-            f"{name}=({peak_lr:.3e}->{min_lr:.3e},rho={radius:g},"
-            f"h_a={shrink_half_life:.3g},a={shrink:.6f})"
+            f"{name}=(rho={rho:g},s={peak_step_scale:.3g}->{min_step_scale:.3g},"
+            f"eta={peak_eta:.3e}->{min_eta:.3e},h_shrink={shrink_half_life:.3g},"
+            f"zeta={shrink:.6f},S={rms_s:.3g})"
         )
     print(
         "schedule "
@@ -577,10 +669,10 @@ def train(args):
         f"beta_half_life={beta_half_life:.3g} beta={memory_beta:.6f} "
         f"readout_mu={readout_mu:.3g} "
         f"optimizer=scionc prenorm={args.prenorm} dropout={args.dropout:.3f} "
-        f"hidden_lmo={args.hidden_lmo} "
-        f"embed_lmo={args.embed_lmo} out_lmo={args.out_lmo} "
+        f"hidden_ulmo={args.hidden_ulmo} "
+        f"embed_ulmo={args.embed_ulmo} out_ulmo={args.out_ulmo} "
         f"qkv=split spi_iteration={args.spi_iteration} "
-        f"lr_groups=" + ", ".join(group_schedule)
+        f"eta_groups=" + ", ".join(group_schedule)
     )
     if args.track_line_probe and args.grad_accum != 1:
         print("line_probe_disabled_requires_grad_accum_1")
@@ -598,16 +690,23 @@ def train(args):
     step_stat_accum = {}
 
     for step in range(args.max_iters):
-        current_lrs = {}
+        current_etas = {}
         for group in opt.param_groups:
-            peak_lr = group.get("peak_lr", args.lr)
-            min_lr = group.get("min_lr", args.min_lr)
-            group_lr = lr_at_step(
-                step, args.max_iters, peak_lr, min_lr, warmup_steps, decay_steps
+            peak_step_scale = group.get("peak_step_scale", group["step_scale"])
+            min_step_scale = group.get("min_step_scale", 0.0)
+            step_scale = schedule_at_step(
+                step,
+                args.max_iters,
+                peak_step_scale,
+                min_step_scale,
+                warmup_steps,
+                decay_steps,
             )
-            group["lr"] = group_lr
-            current_lrs[group.get("name", f"group{len(current_lrs)}")] = group_lr
-        lr = current_lrs.get("hidden", next(iter(current_lrs.values())))
+            group["step_scale"] = step_scale
+            eta = additive_eta(group, step_scale)
+            group["lr"] = eta
+            current_etas[group.get("name", f"group{len(current_etas)}")] = eta
+        eta = current_etas.get("hidden", next(iter(current_etas.values())))
 
         if step % args.eval_interval == 0 or step == args.max_iters - 1:
             train_loss = last_losses["train"]
@@ -645,7 +744,7 @@ def train(args):
             mem_text = cuda_memory_text(device)
             opt_text = step_stats_text(opt_stats)
             print(
-                f"step {step:5d} | lr {lr:.3e} | train {train_loss:.4f} | val {val_loss:.4f} | "
+                f"step {step:5d} | eta {eta:.3e} | train {train_loss:.4f} | val {val_loss:.4f} | "
                 f"best_val {best_val:.4f} | train_seconds {elapsed:.3f} | "
                 f"tok/s {(total_opt_steps * effective_tokens) / elapsed:.0f}"
                 f"{mem_text}{opt_text}"
@@ -702,14 +801,16 @@ def train(args):
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(raw_model.parameters(), args.grad_clip)
         if conv_probe is not None:
-            conv_text = conv_probe.capture(step, current_lrs)
+            conv_text = conv_probe.capture(step, current_etas)
             if conv_text:
                 print(conv_text)
                 if (
-                    args.auto_lr_from_stats
+                    args.auto_step_scale_from_stats
                     and warmup_steps <= step < warmup_steps + stable_steps
                 ):
-                    auto_text = apply_auto_group_lrs(opt, conv_probe.summary, args)
+                    auto_text = apply_auto_group_step_scales(
+                        opt, conv_probe.summary, args
+                    )
                     if auto_text:
                         print(auto_text)
         line_params_before = (
@@ -781,10 +882,10 @@ def train(args):
         print(dataset.decode(y[0].tolist()))
 
     for group in opt.param_groups:
-        stats = getattr(group.get("dir_fn"), "stats", None)
+        stats = getattr(group.get("ulmo"), "stats", None)
         if stats:
             print(
-                f"{group.get('name', 'group')}_lmo_stats "
+                f"{group.get('name', 'group')}_ulmo_stats "
                 + " ".join(f"{k}={v}" for k, v in stats.items())
             )
 
@@ -926,20 +1027,60 @@ def make_parser():
     )
     p.add_argument("--decay-frac", type=float, default=0.15)
 
-    p.add_argument("--lr", type=float, default=3.5e-2)
-    p.add_argument("--lr-embed", dest="lr_embed", type=float, default=None)
-    p.add_argument("--lr-hidden", dest="lr_hidden", type=float, default=None)
-    p.add_argument("--lr-out", "--lr-unembed", dest="lr_out", type=float, default=None)
     p.add_argument(
-        "--min-lr",
+        "--step-scale",
+        type=float,
+        default=1.0,
+        help="dimensionless peak action scale; raw additive eta is derived",
+    )
+    p.add_argument(
+        "--step-scale-embed", dest="step_scale_embed", type=float, default=None
+    )
+    p.add_argument(
+        "--step-scale-hidden", dest="step_scale_hidden", type=float, default=None
+    )
+    p.add_argument(
+        "--step-scale-out",
+        "--step-scale-unembed",
+        dest="step_scale_out",
+        type=float,
+        default=None,
+    )
+    p.add_argument(
+        "--min-step-scale",
         type=float,
         default=0.0,
-        help="decay floor",
+        help="dimensionless decay floor for action scale",
     )
-    p.add_argument("--min-lr-embed", dest="min_lr_embed", type=float, default=None)
-    p.add_argument("--min-lr-hidden", dest="min_lr_hidden", type=float, default=None)
     p.add_argument(
-        "--min-lr-out", "--min-lr-unembed", dest="min_lr_out", type=float, default=None
+        "--min-step-scale-embed",
+        dest="min_step_scale_embed",
+        type=float,
+        default=None,
+    )
+    p.add_argument(
+        "--min-step-scale-hidden",
+        dest="min_step_scale_hidden",
+        type=float,
+        default=None,
+    )
+    p.add_argument(
+        "--min-step-scale-out",
+        "--min-step-scale-unembed",
+        dest="min_step_scale_out",
+        type=float,
+        default=None,
+    )
+    p.add_argument(
+        "--rho",
+        type=float,
+        default=None,
+        help="steady-state radius for all optimizer groups",
+    )
+    p.add_argument("--rho-embed", dest="rho_embed", type=float, default=None)
+    p.add_argument("--rho-hidden", dest="rho_hidden", type=float, default=None)
+    p.add_argument(
+        "--rho-out", "--rho-unembed", dest="rho_out", type=float, default=None
     )
     p.add_argument(
         "--beta-half-life",
@@ -954,22 +1095,22 @@ def make_parser():
         help="dimensionless Nesterov readout blend",
     )
     p.add_argument(
-        "--hidden-lmo",
+        "--hidden-ulmo",
         choices=["streaming-svd", "svd-filter", "gram-ns"],
         default="gram-ns",
-        help="hidden-matrix LMO",
+        help="hidden-matrix ULMO",
     )
     p.add_argument(
-        "--embed-lmo",
+        "--embed-ulmo",
         choices=["colnorm", "sign", "rownorm"],
         default="colnorm",
-        help="embedding-table LMO",
+        help="embedding-table ULMO",
     )
     p.add_argument(
-        "--out-lmo",
+        "--out-ulmo",
         choices=["sign", "colnorm", "rownorm"],
         default="sign",
-        help="output-head LMO",
+        help="output-head ULMO",
     )
     p.add_argument("--pe-steps", type=int, default=5, help="Gram-NS coefficient steps")
     p.add_argument("--spi-steps", type=int, default=1)
@@ -983,9 +1124,6 @@ def make_parser():
     p.add_argument("--filter-ridge", type=float, default=1e-3)
     p.add_argument("--spi-refresh-interval", type=int, default=100)
     p.add_argument("--spi-refresh-threshold", type=float, default=0.10)
-    p.add_argument("--rho-embed", type=float, default=1.0)
-    p.add_argument("--rho-hidden", type=float, default=3.0)
-    p.add_argument("--rho-out", type=float, default=10.0)
     p.add_argument(
         "--shrink-half-life",
         type=float,
@@ -1045,7 +1183,7 @@ def make_parser():
     p.add_argument(
         "--track-line-probe",
         action="store_true",
-        help="estimate same-batch LR aggressiveness with one extra forward",
+        help="estimate same-batch eta aggressiveness with one extra forward",
     )
     p.add_argument(
         "--line-probe-interval",
@@ -1065,10 +1203,11 @@ def make_parser():
         help="optimizer-step interval for convergence probes",
     )
     p.add_argument(
-        "--convergence-alpha",
+        "--convergence-action-scale",
+        dest="convergence_action_scale",
         type=float,
         default=0.5,
-        help="safety factor used when reporting LR predicted from L1 stats",
+        help="target normalized action scale for L1-derived eta reports",
     )
     p.add_argument(
         "--convergence-probe",
@@ -1077,21 +1216,24 @@ def make_parser():
         help="which parameters to include in convergence probes",
     )
     p.add_argument(
-        "--auto-lr-from-stats",
+        "--auto-step-scale-from-stats",
+        dest="auto_step_scale_from_stats",
         action="store_true",
-        help="set group peak LRs from convergence L1 estimates after warmup",
+        help="set group peak step scales from convergence L1 estimates after warmup",
     )
     p.add_argument(
-        "--auto-lr-alpha",
+        "--auto-action-scale",
+        dest="auto_action_scale",
         type=float,
         default=1.25,
-        help="target normalized Lion-K step alpha = lr * L1",
+        help="target normalized action scale eta * L1",
     )
     p.add_argument(
-        "--auto-lr-beta",
+        "--auto-l1-beta",
+        dest="auto_l1_beta",
         type=float,
         default=0.8,
-        help="EMA beta for L1 estimates used by --auto-lr-from-stats",
+        help="EMA beta for L1 estimates used by --auto-step-scale-from-stats",
     )
     return p
 

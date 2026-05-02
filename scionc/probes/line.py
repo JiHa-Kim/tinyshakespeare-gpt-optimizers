@@ -64,7 +64,7 @@ def line_probe_text(
         return ""
     actual = loss_before - loss_after
     ratio = actual / pred
-    alpha = 2.0 * (1.0 - ratio)
+    quadratic = 2.0 * (1.0 - ratio)
     lr2_update_sq = sum(values.get("lr2_update_sq", 0.0) for values in stats.values())
     curvature = (
         2.0 * (loss_after - loss_before + pred) / lr2_update_sq
@@ -75,7 +75,7 @@ def line_probe_text(
     return (
         f"line_probe step {step:5d} | "
         f"pred {pred:.3e} | actual {actual:.3e} | "
-        f"ratio {ratio:.3f} | alpha {alpha:.3f} | curv {curvature:.3e}"
+        f"ratio {ratio:.3f} | quad {quadratic:.3f} | curv {curvature:.3e}"
         f"{obj}"
     )
 

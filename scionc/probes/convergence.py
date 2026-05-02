@@ -4,12 +4,12 @@ from dataclasses import dataclass
 
 import torch
 
-from scionc.lmos import (
-    ColNormLMO,
-    GramNewtonSchulzLMO,
-    RowNormLMO,
-    SignLMO,
-    StreamingSVDSpectralLMO,
+from scionc.ulmos import (
+    ColNormULMO,
+    GramNewtonSchulzULMO,
+    RowNormULMO,
+    SignULMO,
+    StreamingSVDULMO,
     gram_newton_schulz_uvt,
 )
 from scionc.models import GPT
@@ -20,7 +20,7 @@ class ConvergenceItem:
     name: str
     group: str
     param: torch.Tensor
-    lmo: object
+    ulmo: object
 
 
 def median(values: list[float]) -> float:
@@ -33,53 +33,53 @@ def median(values: list[float]) -> float:
     return 0.5 * (values[mid - 1] + values[mid])
 
 
-def oriented_matrix(x: torch.Tensor, lmo) -> torch.Tensor:
-    return x.mT if getattr(lmo, "transpose", False) else x
+def oriented_matrix(x: torch.Tensor, ulmo) -> torch.Tensor:
+    return x.mT if getattr(ulmo, "transpose", False) else x
 
 
-def spectral_lmo_scale(x: torch.Tensor, lmo) -> float:
+def spectral_ulmo_scale(x: torch.Tensor, ulmo) -> float:
     scale = math.sqrt(x.size(0) / x.size(1))
-    return max(1.0, scale) if getattr(lmo, "input_like", False) else scale
+    return max(1.0, scale) if getattr(ulmo, "input_like", False) else scale
 
 
-def is_spectral_lmo(lmo) -> bool:
-    return isinstance(lmo, GramNewtonSchulzLMO | StreamingSVDSpectralLMO)
+def is_spectral_ulmo(ulmo) -> bool:
+    return isinstance(ulmo, GramNewtonSchulzULMO | StreamingSVDULMO)
 
 
 def spectral_support_dual(
-    x: torch.Tensor, lmo, param: torch.Tensor | None, eps: float
+    x: torch.Tensor, ulmo, param: torch.Tensor | None, eps: float
 ) -> float:
     x = x.detach()
-    if isinstance(lmo, GramNewtonSchulzLMO):
+    if isinstance(ulmo, GramNewtonSchulzULMO):
         x32 = x.float()
         polar = gram_newton_schulz_uvt(
-            x32, lmo.steps, lmo.eps, lmo.work_dtype, lmo.bound_safety
+            x32, ulmo.steps, ulmo.eps, ulmo.work_dtype, ulmo.bound_safety
         ).float()
-        return max(0.0, float((x32 * polar).sum()) * spectral_lmo_scale(x32, lmo))
+        return max(0.0, float((x32 * polar).sum()) * spectral_ulmo_scale(x32, ulmo))
 
-    stat_lmo = copy(lmo)
-    stat_lmo.states = dict(lmo.states)
-    stat_lmo.stats = dict(lmo.stats)
-    stat_lmo._param_key = id(param) if param is not None else None
-    update = stat_lmo(x.clone(memory_format=torch.preserve_format))
+    stat_ulmo = copy(ulmo)
+    stat_ulmo.states = dict(ulmo.states)
+    stat_ulmo.stats = dict(ulmo.stats)
+    stat_ulmo._param_key = id(param) if param is not None else None
+    update = stat_ulmo(x.clone(memory_format=torch.preserve_format))
     return max(0.0, float(-(x.float() * update.float()).sum()))
 
 
 def dual_norm(
-    x: torch.Tensor, lmo, eps: float = 1e-12, param: torch.Tensor | None = None
+    x: torch.Tensor, ulmo, eps: float = 1e-12, param: torch.Tensor | None = None
 ) -> float:
     x = x.float()
-    if is_spectral_lmo(lmo):
-        return spectral_support_dual(x, lmo, param, eps)
+    if is_spectral_ulmo(ulmo):
+        return spectral_support_dual(x, ulmo, param, eps)
 
-    y = oriented_matrix(x, lmo)
-    if isinstance(lmo, SignLMO):
+    y = oriented_matrix(x, ulmo)
+    if isinstance(ulmo, SignULMO):
         return float(y.abs().sum() / max(y.size(1), 1))
-    if isinstance(lmo, ColNormLMO):
+    if isinstance(ulmo, ColNormULMO):
         return float(
             torch.linalg.vector_norm(y, dim=0).sum() * math.sqrt(y.size(0))
         )
-    if isinstance(lmo, RowNormLMO):
+    if isinstance(ulmo, RowNormULMO):
         return float(
             torch.linalg.vector_norm(y, dim=1).sum() / math.sqrt(max(y.size(1), 1))
         )
@@ -106,31 +106,31 @@ def spectral_norm_power(x: torch.Tensor, eps: float = 1e-12, steps: int = 4) -> 
     return float(torch.linalg.vector_norm(x @ v).clamp_min(eps))
 
 
-def primal_norm(x: torch.Tensor, lmo, eps: float = 1e-12) -> float:
+def primal_norm(x: torch.Tensor, ulmo, eps: float = 1e-12) -> float:
     x = x.float()
-    if is_spectral_lmo(lmo):
-        return spectral_norm_power(x, eps) / spectral_lmo_scale(x, lmo)
+    if is_spectral_ulmo(ulmo):
+        return spectral_norm_power(x, eps) / spectral_ulmo_scale(x, ulmo)
 
-    y = oriented_matrix(x, lmo)
-    if isinstance(lmo, SignLMO):
+    y = oriented_matrix(x, ulmo)
+    if isinstance(ulmo, SignULMO):
         return float(y.abs().max() * max(y.size(1), 1))
-    if isinstance(lmo, ColNormLMO):
+    if isinstance(ulmo, ColNormULMO):
         return float(
             torch.linalg.vector_norm(y, dim=0).max() / math.sqrt(y.size(0))
         )
-    if isinstance(lmo, RowNormLMO):
+    if isinstance(ulmo, RowNormULMO):
         return float(
             torch.linalg.vector_norm(y, dim=1).max() * math.sqrt(max(y.size(1), 1))
         )
     return float(torch.linalg.vector_norm(x).clamp_min(eps))
 
 
-def nuclear_rank(x: torch.Tensor, lmo, eps: float = 1e-12) -> float:
-    if not is_spectral_lmo(lmo):
+def nuclear_rank(x: torch.Tensor, ulmo, eps: float = 1e-12) -> float:
+    if not is_spectral_ulmo(ulmo):
         return float("nan")
     x = x.float()
     fro_sq = x.square().sum().clamp_min(eps)
-    nuc = dual_norm(x, lmo, eps) / max(spectral_lmo_scale(x, lmo), eps)
+    nuc = dual_norm(x, ulmo, eps) / max(spectral_ulmo_scale(x, ulmo), eps)
     return float((nuc * nuc) / fro_sq)
 
 
@@ -145,7 +145,7 @@ def stable_rank_from_input(x: torch.Tensor, eps: float = 1e-12) -> float:
 class ConvergenceProbe:
     def __init__(self, model: GPT, opt, args):
         self.interval = args.convergence_interval
-        self.alpha = args.convergence_alpha
+        self.action_scale = args.convergence_action_scale
         self.eps = 1e-12
         self.active = False
         self.prev: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -157,7 +157,7 @@ class ConvergenceProbe:
         groups = {
             id(p): (
                 group.get("name", "group"),
-                group["dir_fn"],
+                group["ulmo"],
             )
             for group in opt.param_groups
             for p in group["params"]
@@ -169,8 +169,8 @@ class ConvergenceProbe:
                 continue
             if keep is not None and name not in keep:
                 continue
-            group, lmo = groups[id(p)]
-            items.append(ConvergenceItem(name, group, p, lmo))
+            group, ulmo = groups[id(p)]
+            items.append(ConvergenceItem(name, group, p, ulmo))
         return items
 
     def _probe_names(self, model: GPT) -> set[str]:
@@ -215,7 +215,7 @@ class ConvergenceProbe:
 
         return hook
 
-    def capture(self, step: int, current_lrs: dict[str, float]) -> str:
+    def capture(self, step: int, current_etas: dict[str, float]) -> str:
         report = self.active
         if not report:
             self.summary = {}
@@ -230,28 +230,34 @@ class ConvergenceProbe:
 
             if report:
                 stats = grouped.setdefault(item.group, {})
-                grad_dual = dual_norm(current_grad, item.lmo, self.eps, item.param)
+                grad_dual = dual_norm(current_grad, item.ulmo, self.eps, item.param)
                 self._append(stats, "gdual", grad_dual)
-                self._append(stats, "lr", current_lrs.get(item.group, float("nan")))
+                self._append(stats, "eta", current_etas.get(item.group, float("nan")))
 
                 if previous is not None:
                     prev_grad, prev_param = previous
                     dgrad = dual_norm(
-                        current_grad - prev_grad, item.lmo, self.eps, item.param
+                        current_grad - prev_grad, item.ulmo, self.eps, item.param
                     )
                     dparam = primal_norm(
-                        current_param - prev_param, item.lmo, self.eps
+                        current_param - prev_param, item.ulmo, self.eps
                     )
                     if dparam > self.eps and grad_dual > self.eps:
                         l1hat = (dgrad / dparam) / grad_dual
                         self._append(stats, "l1", l1hat)
-                        self._append(stats, "lr_pred", self.alpha / l1hat)
-                        lr = current_lrs.get(item.group, float("nan"))
-                        self._append(stats, "alpha_eff", lr * l1hat)
+                        self._append(
+                            stats, "eta_pred", self.action_scale / l1hat
+                        )
+                        eta = current_etas.get(item.group, float("nan"))
+                        self._append(stats, "action_eff", eta * l1hat)
 
                 input_sr = self.input_sr.get(id(item.param))
-                if input_sr is not None and grad.ndim == 2 and is_spectral_lmo(item.lmo):
-                    ratio = nuclear_rank(current_grad, item.lmo, self.eps) / max(
+                if (
+                    input_sr is not None
+                    and grad.ndim == 2
+                    and is_spectral_ulmo(item.ulmo)
+                ):
+                    ratio = nuclear_rank(current_grad, item.ulmo, self.eps) / max(
                         input_sr, self.eps
                     )
                     self._append(stats, "spec_ratio", ratio)
@@ -268,19 +274,19 @@ class ConvergenceProbe:
         parts = []
         self.summary = {}
         for name, stats in grouped.items():
-            fields = [f"lr={median(stats.get('lr', [])):.2e}"]
+            fields = [f"eta={median(stats.get('eta', [])):.2e}"]
             if stats.get("l1"):
                 l1 = median(stats["l1"])
-                alpha_eff = median(stats["alpha_eff"])
-                lr_pred = median(stats["lr_pred"])
+                action_eff = median(stats["action_eff"])
+                eta_pred = median(stats["eta_pred"])
                 self.summary[name] = {
                     "l1": l1,
-                    "alpha_eff": alpha_eff,
-                    "lr_pred": lr_pred,
+                    "action_eff": action_eff,
+                    "eta_pred": eta_pred,
                 }
                 fields.append(f"L1={l1:.2e}")
-                fields.append(f"a={alpha_eff:.2f}")
-                fields.append(f"lr*={lr_pred:.2e}")
+                fields.append(f"act={action_eff:.2f}")
+                fields.append(f"eta*={eta_pred:.2e}")
             fields.append(f"g*={median(stats.get('gdual', [])):.2e}")
             if stats.get("spec_ratio"):
                 spec_ratio = median(stats["spec_ratio"])
