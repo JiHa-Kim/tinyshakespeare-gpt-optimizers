@@ -289,12 +289,8 @@ def resolve_group_step_scale(args, group: str) -> tuple[float, float]:
         floor = args.min_step_scale
     if floor is None:
         floor = 0.1 * peak
-    if not math.isfinite(peak) or peak < 0.0:
-        raise ValueError(f"invalid {group} step scale: {peak}")
-    if not math.isfinite(floor) or floor < 0.0:
-        raise ValueError(f"invalid {group} minimum step scale: {floor}")
-    validate_step_scale(peak, f"{group} step scale")
-    validate_step_scale(floor, f"{group} minimum step scale")
+    peak = validate_step_scale(peak, f"{group} step scale")
+    floor = validate_step_scale(floor, f"{group} minimum step scale")
     if floor > peak:
         raise ValueError(
             f"invalid {group} minimum step scale: {floor}; expected <= peak {peak}"
@@ -328,17 +324,6 @@ def resolve_group_shrink_half_life(args, group: str) -> float:
     return half_life
 
 
-def step_scale_for_additive_eta(
-    base_eta: float,
-    eta: float,
-) -> float:
-    if eta <= 0.0:
-        return 0.0
-    if base_eta <= 0.0:
-        return math.inf
-    return eta / base_eta
-
-
 def apply_auto_group_step_scales(
     opt, summary: dict[str, dict[str, float]], args
 ) -> str:
@@ -352,8 +337,7 @@ def apply_auto_group_step_scales(
         l1 = args.auto_l1_beta * old + (1.0 - args.auto_l1_beta) * l1
         group["auto_l1"] = l1
 
-        eta = args.auto_action_scale / l1
-        step_scale = step_scale_for_additive_eta(float(group["base_eta"]), eta)
+        step_scale = args.auto_action_scale / (l1 * float(group["base_eta"]))
         step_scale = min(
             max(step_scale, group.get("min_step_scale", 0.0)),
             group.get("max_step_scale", step_scale),
@@ -396,10 +380,6 @@ def make_edge_ulmo(kind: str):
     if kind == "sign":
         return SignULMO()
     raise ValueError(f"unsupported edge ULMO: {kind}")
-
-
-def make_embed_ulmo(args, tied: bool = False):
-    return SignULMO() if tied else make_edge_ulmo(args.embed_ulmo)
 
 
 def hidden_params(model: GPT) -> list[torch.Tensor]:
@@ -572,7 +552,7 @@ def optimizer_group_specs(model: GPT, args, work_dtype: torch.dtype):
         (
             "embed",
             [model.tok_emb.weight],
-            make_embed_ulmo(args, tied),
+            SignULMO() if tied else make_edge_ulmo(args.embed_ulmo),
         ),
         (
             "hidden",
