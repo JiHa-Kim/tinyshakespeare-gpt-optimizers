@@ -19,37 +19,47 @@ m'=\beta m+(1-\beta)g,
 \qquad
 v=\operatorname{ulmo}(m'),
 \qquad
-w'=\zeta_t w+(1-\zeta_t)\rho_t v.
+w'=\zeta_t w+\eta_t v.
 ```
 
-The transferable coordinates are the target RMS weight radius `R_W`, the
-momentum-state retention half-life, the weight-retention half-life, and the
-step-scale schedule:
+The tuned coordinates are the additive step-scale schedule `eta_t`, the
+momentum-state retention half-life, the weight-retention half-life, and an
+optional target RMS weight radius `R_W`:
 
 ```math
 \beta=2^{-\Delta\tau/h_\beta},
 \qquad
-\zeta_t=2^{-s_t\Delta\tau/h_\zeta}.
+\zeta_{\mathrm{peak}}=2^{-\Delta\tau/h_\zeta}.
 ```
 
-The hard support radius `rho_t` is derived from the RMS target, not tuned
-directly:
+The default WSD scalar `q_t=s_t/s_peak` schedules the two independent
+coordinates with one simple visible schedule:
+
+```math
+\eta_t=q_t\eta_{\mathrm{peak}},
+\qquad
+\zeta_t=\zeta_{\mathrm{peak}}^{q_t}.
+```
+
+The implied steady-state RMS radius is diagnostic and includes the actual
+entrywise RMS scale of the ULMO atom:
 
 ```math
 A_\zeta=\frac{1+\zeta_t\beta}{1-\zeta_t\beta},
 \qquad
-\rho_t
+R_{\mathrm{ss},t}
 =
-R_W
+\eta_t
 \sqrt{
-\frac{1+\zeta_t}{(1-\zeta_t)A_\zeta}
-},
-\qquad
-\eta_t=(1-\zeta_t)\rho_t.
+\frac{A_\zeta\,\|v_t\|_{\mathrm{rms}}^2}{1-\zeta_t^2}
+}.
 ```
 
 The script stores `eta_t` as the optimizer-group `lr` and stores `zeta_t` as
-`weight_retention`.
+`weight_retention`. By default, the optimizer applies the one-step RMS-targeting
+root capped by this baseline schedule; use `--no-rms-solve` to run the plain
+step-scale schedule. Eval lines print `weight_rms current/target` for each
+optimizer group.
 
 See [docs/scionc_rms_radius_parametrization.md](docs/scionc_rms_radius_parametrization.md)
 for the derivation.
@@ -68,8 +78,10 @@ RMS balance. See
 - batch size: 64
 - gradient accumulation: 1
 - block size: 256
-- target RMS radii: embedding 1, hidden 3, output 10
-- peak step scale: 1 (`log2=0`)
+- target actual RMS radii: embedding 0.70, hidden 0.051, output 0.022
+- peak eta: 0.035 at step scale 1 (`log2=0`)
+- legacy support diagnostics: embedding 1, hidden 3, output 10
+- RMS solve: enabled, capped by the eta schedule
 - schedule floor: 0
 - readout mu: 1
 - momentum-state retention half-life: about 2.21e5 processed tokens
@@ -101,7 +113,6 @@ uv run python -m scionc.train_shakespeare \
   --prenorm rmsnorm \
   --batch-size 64 --grad-accum 1 --block-size 256 \
   --n-layer 6 --n-head 6 --d-model 384 \
-  --rms-radius-embed 1 --rms-radius-hidden 3 --rms-radius-out 10 \
   --log2-step-scale 0 --min-step-scale 0 \
   --warmup-iters 100 --decay-frac 0.15 \
   --beta-half-life 2.214e5 --readout-mu 1 \

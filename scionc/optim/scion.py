@@ -1,3 +1,5 @@
+import math
+
 import torch
 from torch.optim import Optimizer
 
@@ -11,13 +13,11 @@ class ScionC(Optimizer):
     Each group supplies a ULMO. The default constrained SCG update is:
 
         m <- beta * m + (1 - beta) * grad
-        p <- zeta * p + (1 - zeta) * rho * ulmo(m)
+        p <- zeta * p + eta * ulmo(m)
 
-    Internally, the additive scale `(1 - zeta) * rho` is stored in `lr` to
-    match PyTorch optimizer conventions. The group field `weight_retention`
-    stores `zeta`. `memory_beta` is the momentum-state retention. `readout_mu`
-    optionally blends the current gradient and the updated momentum state before
-    the ULMO.
+    The additive scale `eta` is taken from `lr` (step-scale form). If
+    `rms_solve` and `rms_radius` are set on a group, `eta` is dynamically
+    solved via the one-step RMS solve and capped by `lr`.
     """
 
     def __init__(
@@ -28,6 +28,8 @@ class ScionC(Optimizer):
         readout_mu: float = 1.0,
         ulmo=None,
         weight_retention: float = 1.0,
+        rms_radius: float | None = None,
+        rms_solve: bool = False,
     ):
         if lr < 0.0:
             raise ValueError(f"invalid lr: {lr}")
@@ -46,6 +48,8 @@ class ScionC(Optimizer):
                 readout_mu=readout_mu,
                 ulmo=ulmo,
                 weight_retention=weight_retention,
+                rms_radius=rms_radius,
+                rms_solve=rms_solve,
             ),
         )
 
@@ -60,27 +64,62 @@ class ScionC(Optimizer):
             entries = self._collect_entries(group)
             if not entries:
                 continue
+
+            rms_radius = group.get("rms_radius") if group.get("rms_solve") else None
+            rms_targets = group.get("rms_targets") if group.get("rms_solve") else None
             lr = float(group["lr"])
-            weight_retention = float(group["weight_retention"])
+            zeta = float(group["weight_retention"])
             if lr == 0.0:
-                if weight_retention != 1.0:
-                    for p, _ in entries:
-                        p.mul_(weight_retention)
+                if zeta != 1.0:
+                    for _, p, _ in entries:
+                        p.mul_(zeta)
                 continue
 
             updates = self._updates(group["ulmo"], entries)
-            for (p, _), u in zip(entries, updates, strict=True):
-                if weight_retention != 1.0:
-                    p.mul_(weight_retention)
-                p.add_(u, alpha=lr)
+            for (param_index, p, _), u in zip(entries, updates, strict=True):
+                target_radius = None
+                if rms_targets is not None:
+                    target_radius = float(rms_targets[param_index])
+                elif rms_radius is not None:
+                    target_radius = float(rms_radius)
+
+                if target_radius is not None:
+                    s = (p * u).mean().item()
+                    w_sq = p.square().mean().item()
+                    v_sq = max(u.square().mean().item(), 1e-15)
+                    r_sq = target_radius * target_radius
+                    d = zeta * zeta * s * s - v_sq * (zeta * zeta * w_sq - r_sq)
+                    if d >= 0.0:
+                        root = math.sqrt(d)
+                        roots = [
+                            value
+                            for value in (
+                                (-zeta * s - root) / v_sq,
+                                (-zeta * s + root) / v_sq,
+                            )
+                            if value >= 0.0
+                        ]
+                        eta = min(roots) if roots else 0.0
+                    else:
+                        eta = max(0.0, -zeta * s / v_sq)
+                    eta = min(eta, lr)
+                else:
+                    eta = lr
+
+                if zeta != 1.0:
+                    p.mul_(zeta)
+                if eta != 0.0:
+                    p.add_(u, alpha=eta)
 
         return loss
 
-    def _collect_entries(self, group) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    def _collect_entries(
+        self, group
+    ) -> list[tuple[int, torch.Tensor, torch.Tensor]]:
         memory_beta = group["memory_beta"]
         readout_mu = group["readout_mu"]
         entries = []
-        for p in group["params"]:
+        for param_index, p in enumerate(group["params"]):
             g = p.grad
             if g is None:
                 continue
@@ -99,22 +138,22 @@ class ScionC(Optimizer):
                 g.copy_(m)
             elif readout_mu != 0.0:
                 g.lerp_(m, readout_mu)
-            entries.append((p, g))
+            entries.append((param_index, p, g))
         return entries
 
     def _updates(
-        self, ulmo, entries: list[tuple[torch.Tensor, torch.Tensor]]
+        self, ulmo, entries: list[tuple[int, torch.Tensor, torch.Tensor]]
     ) -> list[torch.Tensor]:
         if ulmo is None:
             raise ValueError("ScionC requires a ULMO for every parameter group")
 
         batch_dir = getattr(ulmo, "batch", None)
         if batch_dir is not None:
-            return batch_dir([g for _, g in entries], [p for p, _ in entries])
+            return batch_dir([g for _, _, g in entries], [p for _, p, _ in entries])
 
         set_ulmo_param = getattr(ulmo, "set_param", None)
         updates = []
-        for p, g in entries:
+        for _, p, g in entries:
             if set_ulmo_param is not None:
                 set_ulmo_param(p)
             updates.append(ulmo(g))
