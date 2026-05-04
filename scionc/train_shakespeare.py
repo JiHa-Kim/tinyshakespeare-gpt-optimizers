@@ -3,7 +3,7 @@ import json
 import math
 import time
 from contextlib import nullcontext
-from dataclasses import asdict, fields
+from dataclasses import asdict
 from pathlib import Path
 
 import torch
@@ -590,21 +590,12 @@ def save_eval_checkpoint(
     save_checkpoint(eval_path, model, dataset, args)
 
 
-def load_torch_checkpoint(path: Path, device: torch.device):
-    try:
-        return torch.load(path, map_location=device, weights_only=False)
-    except TypeError:
-        return torch.load(path, map_location=device)
-
-
 def load_checkpoint(path: Path, device: torch.device):
-    ckpt = load_torch_checkpoint(path, device)
+    ckpt = torch.load(path, map_location=device, weights_only=False)
     chars = ckpt["chars"]
     stoi = {ch: i for i, ch in enumerate(chars)}
     itos = {i: ch for i, ch in enumerate(chars)}
-    cfg_keys = {field.name for field in fields(GPTConfig)}
-    cfg = {k: v for k, v in ckpt["model_cfg"].items() if k in cfg_keys}
-    model = GPT(GPTConfig(**cfg)).to(device)
+    model = GPT(GPTConfig(**ckpt["model_cfg"])).to(device)
     model.load_state_dict(ckpt["model"])
     return model, stoi, itos
 
