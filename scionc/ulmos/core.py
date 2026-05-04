@@ -106,100 +106,39 @@ def _moment4_from_gram_square(
     return t1_raw > eps, t1, m2, m3, m4
 
 
-def _moment4_coupled_feasible(
-    t: torch.Tensor,
-    m2: torch.Tensor,
-    m3: torch.Tensor,
-    m4: torch.Tensor,
-    n: int,
-    tol: float,
-) -> torch.Tensor:
-    n_float = float(n)
-    t2 = t.square()
-    t3 = t2 * t
-    t4 = t2.square()
-    m2_sq = m2.square()
-    m3_sq = m3.square()
-    m2m3 = m2 * m3
-    moment_gap = m2 * m4 - m3_sq
-
-    e0 = (m2 - t2) * (m4 - t4) - (m3 - t3).square()
-    d4 = 1.0 - n_float * m2
-    d3 = 2.0 * (n_float * m3 - m2)
-    d2 = 3.0 * m2_sq - 2.0 * m3 - n_float * m4
-    d1 = 2.0 * (m4 - m2m3)
-    d0 = (n_float - 1.0) * moment_gap - m2 * m2_sq + 2.0 * m2m3 - m4
-    det0 = (((d4 * t + d3) * t + d2) * t + d1) * t + d0
-    return torch.minimum(e0, det0) >= -tol
-
-
-def _moment4_support_lower(
-    m2: torch.Tensor, m3: torch.Tensor, m4: torch.Tensor, eps: float
-) -> torch.Tensor:
-    q_a = (m3 - m2.square()).clamp_min(0.0)
-    q_b = m2 * m3 - m4
-    q_c = m2 * m4 - m3.square()
-    q_disc = (q_b.square() - 4.0 * q_a * q_c).clamp_min(0.0)
-    q_root = (-q_b + torch.sqrt(q_disc)) / (2.0 * q_a).clamp_min(eps)
-    linear_root = (-q_c / q_b.clamp_max(-eps)).clamp_min(0.0)
-    q_root = torch.where(q_a > eps, q_root, linear_root)
-    return torch.maximum(torch.maximum(m2, m4 / m3.clamp_min(eps)), q_root)
-
-
-def _moment4_beta_bracket(
-    m2: torch.Tensor,
-    m3: torch.Tensor,
-    m4: torch.Tensor,
-    n: int,
-    eps: float,
-    beta2: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    beta_m4 = torch.sqrt(torch.sqrt(m4.clamp_min(eps)))
-    c_rad = ((n - 1.0) * (n * m4 - m2.square())).clamp_min(0.0)
-    beta_c = torch.sqrt(((m2 + torch.sqrt(c_rad)) / n).clamp_min(eps))
-    hi = torch.minimum(beta2, torch.minimum(beta_m4, beta_c)).clamp(eps, 1.0)
-    support_lower = _moment4_support_lower(m2, m3, m4, eps)
-    return torch.minimum(support_lower, hi), hi, support_lower
-
-
 def _moment4_upper_beta(
     m2: torch.Tensor,
     m3: torch.Tensor,
     m4: torch.Tensor,
     n: int,
     eps: float,
-    beta2: torch.Tensor | None = None,
+    beta2: torch.Tensor,
 ) -> torch.Tensor:
-    return _moment4_beta_interval(m2, m3, m4, n, eps, beta2)[1]
-
-
-def _moment4_beta_interval(
-    m2: torch.Tensor,
-    m3: torch.Tensor,
-    m4: torch.Tensor,
-    n: int,
-    eps: float,
-    beta2: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if beta2 is None:
-        beta2 = _moment2_beta_from_m2(m2, n).clamp(eps, 1.0)
     if n <= 1:
-        beta = beta2.clamp(eps, 1.0)
-        return beta, beta
+        return beta2.clamp(eps, 1.0)
 
-    lower, upper, support_lower = _moment4_beta_bracket(m2, m3, m4, n, eps, beta2)
+    n_f = float(n)
+    lower = torch.sqrt(torch.sqrt(m4.clamp_min(eps)))
+    upper = beta2
+
+    d4 = 1.0 - n_f * m2
+    d3 = 2.0 * (n_f * m3 - m2)
+    d2 = 3.0 * m2.square() - 2.0 * m3 - n_f * m4
+    d1 = 2.0 * (m4 - m2 * m3)
+    d0 = (n_f - 1.0) * (m2 * m4 - m3.square()) - m2 * m2.square() + 2.0 * m2 * m3 - m4
 
     for _ in range(_MOMENT4_REFINE_STEPS):
-        mid = 0.5 * (lower + upper)
-        mid_feasible = _moment4_coupled_feasible(
-            mid, m2, m3, m4, n, _MOMENT4_FEAS_TOL
-        )
-        lower = torch.where(mid_feasible, mid, lower)
-        upper = torch.where(mid_feasible, upper, mid)
+        t = 0.5 * (lower + upper)
+        t2 = t.square()
 
-    upper = upper.clamp(eps, 1.0)
-    # The bisection lower brackets beta_4; the certificate lower is K(t) support.
-    return torch.minimum(support_lower, upper).clamp(eps, 1.0), upper
+        p_t = (((d4 * t + d3) * t + d2) * t + d1) * t + d0
+        e0 = (m2 - t2) * (m4 - t2.square()) - (m3 - t2 * t).square()
+
+        feasible = torch.minimum(e0, p_t) >= -_MOMENT4_FEAS_TOL
+        lower = torch.where(feasible, t, lower)
+        upper = torch.where(feasible, upper, t)
+
+    return upper.clamp(eps, 1.0)
 
 
 def _spectral_bound_from_beta(
@@ -229,8 +168,10 @@ def _spectral_bounds_from_moments(
     dot_dim: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     beta2 = _moment2_beta_from_m2(m2, n).clamp(eps, 1.0)
-    lower_beta, upper_beta = _moment4_beta_interval(m2, m3, m4, n, eps, beta2)
+    upper_beta = _moment4_upper_beta(m2, m3, m4, n, eps, beta2)
     upper_beta = torch.minimum(beta2, upper_beta.to(beta2.dtype)).clamp(eps, 1.0)
+    
+    lower_beta = torch.sqrt(torch.sqrt(m4.clamp_min(eps)))
     lower_beta = torch.minimum(lower_beta.to(beta2.dtype), upper_beta)
 
     lower = torch.where(active, (t1 * lower_beta).clamp_min(0.0), torch.zeros_like(t1))
