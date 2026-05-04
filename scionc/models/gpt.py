@@ -24,20 +24,13 @@ def rms_norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return x * torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + eps)
 
 
-def rms_ball_proj(x: torch.Tensor) -> torch.Tensor:
-    return x * torch.rsqrt(x.square().mean(dim=-1, keepdim=True).clamp_min_(1.0))
-
-
 class Norm(nn.Module):
-    def __init__(self, kind: str = "rmsnorm", eps: float = 1e-6):
+    def __init__(self, eps: float = 1e-6):
         super().__init__()
-        if kind not in {"rmsnorm", "rmsball"}:
-            raise ValueError(f"invalid norm kind: {kind}")
-        self.kind = kind
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return rms_norm(x, self.eps) if self.kind == "rmsnorm" else rms_ball_proj(x)
+        return rms_norm(x, self.eps)
 
 
 def rotary_cache(seq_len: int, head_dim: int, base: float = 10000.0):
@@ -116,16 +109,15 @@ class Block(nn.Module):
         n_head: int,
         hidden_dim: int,
         block_size: int,
-        prenorm: str = "rmsnorm",
         rope_base: float = 10000.0,
         dropout: float = 0.0,
     ):
         super().__init__()
-        self.norm1 = Norm(prenorm)
+        self.norm1 = Norm()
         self.attn = CausalSelfAttention(
             d_model, n_head, block_size, rope_base, dropout
         )
-        self.norm2 = Norm(prenorm)
+        self.norm2 = Norm()
         self.mlp = MLP(d_model, hidden_dim, dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -141,7 +133,6 @@ class GPTConfig:
     n_head: int = 6
     d_model: int = 384
     rope_base: float = 10000.0
-    prenorm: str = "rmsnorm"
     dropout: float = 0.0
     tie_weights: bool = False
 
@@ -162,14 +153,13 @@ class GPT(nn.Module):
                     cfg.n_head,
                     cfg.hidden_dim,
                     cfg.block_size,
-                    cfg.prenorm,
                     cfg.rope_base,
                     cfg.dropout,
                 )
                 for _ in range(cfg.n_layer)
             ]
         )
-        self.norm_f = Norm(cfg.prenorm)
+        self.norm_f = Norm()
         self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
         if cfg.tie_weights:
             self.lm_head.weight = self.tok_emb.weight

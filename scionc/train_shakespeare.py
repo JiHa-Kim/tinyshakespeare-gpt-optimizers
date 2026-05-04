@@ -667,7 +667,6 @@ def build_model(args, dataset: CharDataset, device: torch.device) -> GPT:
         n_head=args.n_head,
         d_model=args.d_model,
         rope_base=args.rope_base,
-        prenorm=args.prenorm,
         dropout=args.dropout,
         tie_weights=args.tie_weights,
     )
@@ -850,7 +849,7 @@ def train(args):
         f"count_increment={effective_tokens} "
         f"beta_half_life={beta_half_life:.3g} beta={memory_beta:.6f} "
         f"readout_mu={readout_mu:.3g} "
-        f"optimizer=scionc prenorm={args.prenorm} dropout={args.dropout:.3f} "
+        f"optimizer=scionc dropout={args.dropout:.3f} "
         f"hidden_ulmo={args.hidden_ulmo} "
         f"io_weights={io_weights} embed_ulmo={args.embed_ulmo} out_ulmo={args.out_ulmo} "
         f"qkv=split spi_iteration={args.spi_iteration} "
@@ -875,7 +874,6 @@ def train(args):
             "eta_groups": eta_groups,
         },
         model={
-            "prenorm": args.prenorm,
             "dropout": args.dropout,
             "hidden_ulmo": args.hidden_ulmo,
             "io_weights": io_weights,
@@ -1242,7 +1240,6 @@ def make_parser():
     p.add_argument("--n-head", type=int, default=6)
     p.add_argument("--d-model", type=int, default=384)
     p.add_argument("--rope-base", type=float, default=10000.0)
-    p.add_argument("--prenorm", choices=["rmsnorm", "rmsball"], default="rmsnorm")
     p.add_argument("--dropout", type=float, default=0.15)
     p.add_argument(
         "--tie-weights",

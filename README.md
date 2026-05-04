@@ -89,7 +89,6 @@ uv run python -m scionc.train_shakespeare \
   --mode train \
   --out-path out/scionc_target_rms_2k.pt \
   --sample-out out/scionc_target_rms_2k_samples.md \
-  --prenorm rmsnorm \
   --batch-size 64 --grad-accum 1 --block-size 256 \
   --n-layer 6 --n-head 6 --d-model 384 \
   --log2-step-scale 0 --min-step-scale 0 \
