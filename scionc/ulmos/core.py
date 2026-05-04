@@ -488,9 +488,11 @@ class GramNewtonSchulzULMO:
                 self.refine_steps,
                 self.feas_tol,
             )
+            scale = y_batch.new_tensor([-self._scale(x) for _, x, _, _ in items])
+            y_batch.mul_(scale.reshape(-1, 1, 1))
             for j, (i, x, _, transposed) in enumerate(items):
                 y = y_batch[j].mT if transposed else y_batch[j]
-                out[i] = y.mul_(-self._scale(x))
+                out[i] = y
 
         if any(x is None for x in out):
             raise RuntimeError("batched GramNewtonSchulzULMO missed an output")

@@ -5,22 +5,22 @@ __all__ = ["ScionC"]
 
 
 def _rms_solved_group_eta(
-    entries: list[tuple[int, torch.Tensor, torch.Tensor]],
+    params: list[torch.Tensor],
     updates: list[torch.Tensor],
     shrink: float,
     target_radius: float,
     lr: float,
 ) -> torch.Tensor:
-    total = sum(p.numel() for _, p, _ in entries)
+    total = sum(p.numel() for p in params)
     if total <= 0:
         return torch.zeros((), device=updates[0].device, dtype=updates[0].dtype)
 
     s = sum(
         (p * u).sum(dtype=torch.float32)
-        for (_, p, _), u in zip(entries, updates, strict=True)
+        for p, u in zip(params, updates, strict=True)
     )
-    w_sq = sum(p.square().sum(dtype=torch.float32) for _, p, _ in entries)
-    v_sq = sum(u.square().sum(dtype=torch.float32) for u in updates).clamp_min(1e-15)
+    w_sq = torch.stack(torch._foreach_norm(params)).square().sum()
+    v_sq = torch.stack(torch._foreach_norm(updates)).square().sum().clamp_min(1e-15)
     s = s / total
     w_sq = w_sq / total
     v_sq = v_sq / total
@@ -112,7 +112,7 @@ class ScionC(Optimizer):
                 torch._foreach_add_(params, updates, alpha=lr)
             else:
                 eta = _rms_solved_group_eta(
-                    entries, updates, shrink, float(target_radius), lr
+                    params, updates, shrink, float(target_radius), lr
                 )
                 if shrink != 1.0:
                     torch._foreach_mul_(params, shrink)
