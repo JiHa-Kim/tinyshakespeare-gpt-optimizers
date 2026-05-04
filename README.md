@@ -1,8 +1,8 @@
-# Minimal Lion-K / ScionC Repo
+# Minimal ScionC Repo
 
 A compact ScionC sandbox organized by category:
 
-- `scionc/optim/`: ScionC plus lower-level Lion-K experiments.
+- `scionc/optim/`: ScionC optimizer and schedule parametrization helpers.
 - `scionc/ulmos/`: ULMOs, Gram-NS, streaming SVD, and SVD-filter helpers.
 - `scionc/models/`: compact GPT model and tiny Shakespeare data utilities.
 - `scionc/probes/`: convergence, line, and optimizer-step stats probes.
