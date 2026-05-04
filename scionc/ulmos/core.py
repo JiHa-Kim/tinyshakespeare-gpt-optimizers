@@ -16,7 +16,6 @@ __all__ = [
     "StreamingSVDULMO",
     "HiddenSVDFilterULMO",
     "SignULMO",
-    "spectral_moment_bounds_sq",
     "init_colnorm_",
     "init_rownorm_",
     "init_spectral_",
@@ -172,42 +171,6 @@ def _spectral_bounds_from_gram(
     upper = (trace * upper_beta + roundoff).mul(safety).clamp_min(eps)
     upper = torch.where(active, upper, torch.ones_like(upper))
     return lower, upper
-
-
-def spectral_moment_bounds_sq(
-    x: torch.Tensor,
-    eps: float = 1e-7,
-    safety: float = 1.0,
-    fp32_eps: float = _FP32_EPS,
-    refine_steps: int = _MOMENT4_REFINE_STEPS,
-    feas_tol: float = _MOMENT4_FEAS_TOL,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if x.ndim < 2 or x.numel() == 0:
-        norm_sq = x.float().square().sum()
-        return norm_sq, norm_sq
-
-    batch_shape = x.shape[:-2]
-    y = x.reshape(-1, *x.shape[-2:]).float() if batch_shape else x.unsqueeze(0).float()
-    if y.size(-2) > y.size(-1):
-        y = y.mT
-
-    gram = torch.bmm(y, y.mT)
-    gram_square = torch.bmm(gram, gram)
-    lower, upper = _spectral_bounds_from_gram(
-        gram,
-        eps,
-        safety,
-        gram_square,
-        y.size(-1),
-        fp32_eps,
-        refine_steps,
-        feas_tol,
-    )
-    fro_sq = gram.diagonal(dim1=-2, dim2=-1).sum(-1, dtype=torch.float32)
-    upper = torch.where(fro_sq > eps, upper, fro_sq)
-    if not batch_shape:
-        return lower.squeeze(0), upper.squeeze(0)
-    return lower.reshape(batch_shape), upper.reshape(batch_shape)
 
 
 def _scale_gram_and_first_poly(
