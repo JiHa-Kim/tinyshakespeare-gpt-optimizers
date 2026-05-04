@@ -402,10 +402,6 @@ def make_embed_ulmo(args, tied: bool = False):
     return SignULMO() if tied else make_edge_ulmo(args.embed_ulmo)
 
 
-def make_out_ulmo(args):
-    return make_edge_ulmo(args.out_ulmo)
-
-
 def hidden_params(model: GPT) -> list[torch.Tensor]:
     skip = {id(model.tok_emb.weight), id(model.lm_head.weight)}
     return [p for p in model.parameters() if p.requires_grad and id(p) not in skip]
@@ -585,7 +581,7 @@ def optimizer_group_specs(model: GPT, args, work_dtype: torch.dtype):
         ),
     ]
     if not tied:
-        specs.append(("out", [model.lm_head.weight], make_out_ulmo(args)))
+        specs.append(("out", [model.lm_head.weight], make_edge_ulmo(args.out_ulmo)))
     return specs
 
 
@@ -625,15 +621,12 @@ def configure_optimizer_actions(opt, args) -> None:
         configure_group_rms_targets(group)
 
 
-def group_ulmo(opt, name: str, cls):
-    for group in opt.param_groups:
-        if group.get("name") == name and isinstance(group.get("ulmo"), cls):
-            return group["ulmo"]
-    return None
-
-
 def hidden_cov_ulmo(opt):
-    return group_ulmo(opt, "hidden", HiddenSVDFilterULMO)
+    for group in opt.param_groups:
+        ulmo = group.get("ulmo")
+        if group.get("name") == "hidden" and isinstance(ulmo, HiddenSVDFilterULMO):
+            return ulmo
+    return None
 
 
 def register_hidden_cov_hooks(model: GPT, ulmo):
@@ -718,11 +711,6 @@ def save_eval_checkpoint(
         f"{path.stem}_step{step:05d}_val{val_loss:.4f}{path.suffix}"
     )
     save_checkpoint(eval_path, model, dataset, args)
-
-
-def save_final_checkpoint(path: Path, model: GPT, dataset: CharDataset, args):
-    final_path = path.with_name(f"{path.stem}_final{path.suffix}")
-    save_checkpoint(final_path, model, dataset, args)
 
 
 def state_checkpoint_path(path: Path, args, step: int) -> Path:
@@ -1175,8 +1163,12 @@ def train(args):
                         Path(args.out_path), step, val_loss, raw_model, dataset, args
                     )
                     if step == args.max_iters - 1:
-                        save_final_checkpoint(
-                            Path(args.out_path), raw_model, dataset, args
+                        path = Path(args.out_path)
+                        save_checkpoint(
+                            path.with_name(f"{path.stem}_final{path.suffix}"),
+                            raw_model,
+                            dataset,
+                            args,
                         )
 
             elapsed = max(sync_now(device) - train_start, 1e-9)
@@ -1382,13 +1374,7 @@ def train(args):
 
 @torch.inference_mode()
 def sample(args):
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
-
-    device = torch.device(
-        args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    )
+    device, _ = configure_runtime(args)
     model, stoi, itos = load_checkpoint(Path(args.out_path), device)
     prompt = args.prompt or "\n"
     bad = [c for c in prompt if c not in stoi]
@@ -1472,21 +1458,7 @@ def sample_report(args, texts: list[str]) -> str:
 
 @torch.inference_mode()
 def evaluate(args):
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
-
-    device = torch.device(
-        args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    )
-    if device.type == "cuda":
-        torch.cuda.reset_peak_memory_stats(device)
-    amp_dtype = (
-        torch.bfloat16
-        if device.type == "cuda" and torch.cuda.is_bf16_supported()
-        else None
-    )
-
+    device, amp_dtype = configure_runtime(args)
     data_path = Path(args.data_path)
     maybe_download_tiny_shakespeare(data_path)
     dataset = CharDataset(data_path)

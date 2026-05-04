@@ -13,7 +13,6 @@ __all__ = [
     "ColNormULMO",
     "RowNormULMO",
     "GramNewtonSchulzULMO",
-    "SpectralULMO",
     "StreamingSVDULMO",
     "HiddenSVDFilterULMO",
     "SignULMO",
@@ -22,7 +21,6 @@ __all__ = [
     "init_rownorm_",
     "init_spectral_",
     "init_sign_",
-    "init_semiorthogonal_",
 ]
 
 
@@ -536,9 +534,6 @@ class GramNewtonSchulzULMO:
         return out
 
 
-SpectralULMO = GramNewtonSchulzULMO
-
-
 @torch.no_grad()
 def init_colnorm_(
     w: torch.Tensor,
@@ -593,11 +588,4 @@ def init_spectral_(
     w_fp.mul_(radius * scale)
     w.data.copy_(w_fp.to(dtype=w.dtype))
     return w
-
-
-@torch.no_grad()
-def init_semiorthogonal_(
-    w: torch.Tensor, radius: float = 1.0, input_like: bool = False
-) -> torch.Tensor:
-    return init_spectral_(w, radius=radius, input_like=input_like)
 
