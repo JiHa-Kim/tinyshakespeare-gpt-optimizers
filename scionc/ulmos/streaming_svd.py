@@ -2,8 +2,6 @@ import math
 
 import torch
 
-_FilterEntry = tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]
-_FilterGroupKey = tuple[tuple[int, ...], tuple[int, ...], torch.dtype, torch.device]
 _SVDGroupKey = tuple[tuple[int, ...], torch.dtype, torch.device]
 _SVDItem = tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, bool, float]
 
@@ -290,109 +288,4 @@ class StreamingSVDULMO:
             out = out.mT
         self.stats["calls"] += 1
         return out.to(dtype=x.dtype).mul_(-scale)
-
-
-class HiddenSVDFilterULMO(StreamingSVDULMO):
-    """
-    Streaming-SVD hidden update with the closed-form diagonal filter for
-    q(D)=tr(D A D^T), where A is the incoming activation covariance.
-    """
-
-    __slots__ = (
-        "cov_accums",
-        "cov_cache",
-        "filter_ridge",
-    )
-
-    def __init__(
-        self,
-        *args,
-        filter_ridge: float = 1e-3,
-        **kwargs,
-    ):
-        if filter_ridge < 0.0:
-            raise ValueError(f"invalid filter_ridge: {filter_ridge}")
-        super().__init__(*args, **kwargs)
-        self.cov_accums = {}
-        self.cov_cache = {}
-        self.filter_ridge = filter_ridge
-        self.stats.update({"filtered": 0, "missing_covs": 0, "cov_updates": 0})
-
-    def add_covariance(self, p: torch.Tensor, cov: torch.Tensor, count: int) -> None:
-        state = self.cov_accums.get(id(p))
-        if state is None:
-            self.cov_accums[id(p)] = [cov, count]
-        else:
-            state[0] = state[0] + cov
-            state[1] += count
-
-    def _cov_for(self, p: torch.Tensor) -> torch.Tensor | None:
-        key = id(p)
-        state = self.cov_accums.get(key)
-        if state is not None:
-            cov_sum, count = state
-            if count > 0:
-                self.cov_cache[key] = (cov_sum / count).detach()
-                self.stats["cov_updates"] += 1
-        return self.cov_cache.get(key)
-
-    def _coeff_from_denom(
-        self, denom: torch.Tensor, sigma: torch.Tensor
-    ) -> torch.Tensor:
-        denom = denom.clamp_min(self.eps)
-        scale = denom.mean(dim=-1, keepdim=True).abs().clamp_min(self.eps)
-        denom = denom + self.filter_ridge * scale
-
-        raw = torch.nan_to_num(sigma / denom, nan=0.0, posinf=0.0, neginf=0.0)
-        budget = denom.sum(dim=-1, keepdim=True).clamp_min(self.eps)
-        q_norm = denom.mul(raw.square()).sum(dim=-1, keepdim=True).clamp_min(self.eps)
-        return raw * torch.sqrt(budget / q_norm)
-
-    def _output_scale(
-        self,
-        items: list[_SVDItem],
-        v_batch: torch.Tensor,
-        mv: torch.Tensor,
-        sigma: torch.Tensor,
-    ) -> torch.Tensor:
-        scales = list(sigma.reciprocal().unbind())
-        groups: dict[_FilterGroupKey, list[_FilterEntry]] = {}
-        for i, (_, _, p, _, transposed, _) in enumerate(items):
-            cov = self._cov_for(p)
-            if cov is None:
-                self.stats["missing_covs"] += 1
-                continue
-            basis = (
-                mv[i] / sigma[i].unsqueeze(0).clamp_min(self.eps)
-                if transposed
-                else v_batch[i]
-            )
-            key = (tuple(cov.shape), tuple(basis.shape), basis.dtype, basis.device)
-            groups.setdefault(key, []).append((i, cov, basis, sigma[i]))
-
-        for entries in groups.values():
-            cov = torch.stack([x[1] for x in entries])
-            basis = torch.stack([x[2] for x in entries])
-            sig = torch.stack([x[3] for x in entries])
-            coeff = self._coeff_batch(cov, basis, sig)
-            self.stats["filtered"] += len(entries)
-            for j, (i, _, _, _) in enumerate(entries):
-                scales[i] = coeff[j] / sig[j].clamp_min(self.eps)
-
-        return torch.stack(scales)
-
-    def _coeff_batch(
-        self, cov: torch.Tensor, basis: torch.Tensor, sigma: torch.Tensor
-    ) -> torch.Tensor:
-        cov = cov.to(device=basis.device, dtype=basis.dtype)
-        denom = (cov @ basis).mul(basis).sum(dim=-2).clamp_min(self.eps)
-        return self._coeff_from_denom(denom, sigma)
-
-    def batch(
-        self, tensors: list[torch.Tensor], params: list[torch.Tensor]
-    ) -> list[torch.Tensor]:
-        try:
-            return super().batch(tensors, params)
-        finally:
-            self.cov_accums.clear()
 

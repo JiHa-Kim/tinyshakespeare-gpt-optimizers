@@ -3,7 +3,7 @@
 A compact ScionC sandbox organized by category:
 
 - `scionc/optim/`: ScionC optimizer and schedule parametrization helpers.
-- `scionc/ulmos/`: ULMOs, Gram-NS, streaming SVD, and SVD-filter helpers.
+- `scionc/ulmos/`: ULMOs, Gram-NS, and streaming SVD helpers.
 - `scionc/models/`: compact GPT model and tiny Shakespeare data utilities.
 - `scionc/probes/`: convergence, line, and optimizer-step stats probes.
 - `scionc/train_shakespeare.py`: training entrypoint.
@@ -81,9 +81,6 @@ product already needed by the polynomial iteration.
 
 `--hidden-ulmo streaming-svd` keeps a per-parameter cached right-singular basis
 and applies one or more streaming subspace steps per optimizer update.
-
-`--hidden-ulmo svd-filter` adds an experimental diagonal filter using the exact
-incoming activation covariance for hidden linear layers.
 
 ## Recommended Command
 

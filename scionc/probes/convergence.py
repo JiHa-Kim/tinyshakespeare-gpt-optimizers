@@ -8,9 +8,9 @@ from scionc.ulmos.core import (
     GramNewtonSchulzULMO,
     RowNormULMO,
     SignULMO,
-    StreamingSVDULMO,
     gram_newton_schulz_uvt,
 )
+from scionc.ulmos.streaming_svd import StreamingSVDULMO
 from scionc.models.gpt import GPT
 
 

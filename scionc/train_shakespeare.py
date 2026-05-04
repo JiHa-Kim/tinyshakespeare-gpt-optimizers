@@ -19,7 +19,7 @@ from scionc.ulmos.core import (
     init_sign_,
     init_spectral_,
 )
-from scionc.ulmos.streaming_svd import HiddenSVDFilterULMO, StreamingSVDULMO
+from scionc.ulmos.streaming_svd import StreamingSVDULMO
 from scionc.optim.scion import ScionC
 from scionc.optim.parametrization import (
     halving_factor,
@@ -29,9 +29,7 @@ from scionc.optim.parametrization import (
 )
 from scionc.models.gpt import (
     GPT,
-    MLP,
     BatchSource,
-    CausalSelfAttention,
     CharDataset,
     GPTConfig,
     maybe_download_tiny_shakespeare,
@@ -349,15 +347,6 @@ def apply_auto_group_step_scales(
 def make_hidden_ulmo(args, work_dtype: torch.dtype):
     if args.hidden_ulmo == "gram-ns":
         return GramNewtonSchulzULMO(steps=args.pe_steps, work_dtype=work_dtype)
-    if args.hidden_ulmo == "svd-filter":
-        return HiddenSVDFilterULMO(
-            steps=args.spi_steps,
-            ridge=args.spi_ridge,
-            refresh_interval=args.spi_refresh_interval,
-            refresh_threshold=args.spi_refresh_threshold,
-            iteration=args.spi_iteration,
-            filter_ridge=args.filter_ridge,
-        )
     return StreamingSVDULMO(
         steps=args.spi_steps,
         ridge=args.spi_ridge,
@@ -575,69 +564,6 @@ def build_optimizer(model: GPT, args, device: torch.device):
         readout_mu=args.readout_mu,
         memory_beta=memory_beta,
     )
-
-
-def hidden_cov_ulmo(opt):
-    for group in opt.param_groups:
-        ulmo = group.get("ulmo")
-        if group.get("name") == "hidden" and isinstance(ulmo, HiddenSVDFilterULMO):
-            return ulmo
-    return None
-
-
-def register_hidden_cov_hooks(model: GPT, ulmo):
-    handles = []
-
-    def covariance(x):
-        flat = x.detach().reshape(-1, x.size(-1))
-        return (flat.mT @ flat).float(), flat.size(0)
-
-    def make_linear_hook(weight):
-        def hook(_module, inputs):
-            if not _module.training or not torch.is_grad_enabled():
-                return
-            cov, count = covariance(inputs[0])
-            ulmo.add_covariance(weight, cov, count)
-
-        return hook
-
-    def make_mlp_hook(module: MLP):
-        def hook(_module, inputs):
-            if not _module.training or not torch.is_grad_enabled():
-                return
-            cov, count = covariance(inputs[0])
-            ulmo.add_covariance(module.gate.weight, cov, count)
-            ulmo.add_covariance(module.up.weight, cov, count)
-
-        return hook
-
-    def make_qkv_hook(module: CausalSelfAttention):
-        def hook(_module, inputs):
-            if not _module.training or not torch.is_grad_enabled():
-                return
-            cov, count = covariance(inputs[0])
-            ulmo.add_covariance(module.q.weight, cov, count)
-            ulmo.add_covariance(module.k.weight, cov, count)
-            ulmo.add_covariance(module.v.weight, cov, count)
-
-        return hook
-
-    for module in model.modules():
-        if isinstance(module, CausalSelfAttention):
-            handles.append(module.register_forward_pre_hook(make_qkv_hook(module)))
-            handles.append(
-                module.proj.register_forward_pre_hook(
-                    make_linear_hook(module.proj.weight)
-                )
-            )
-        elif isinstance(module, MLP):
-            handles.append(module.register_forward_pre_hook(make_mlp_hook(module)))
-            handles.append(
-                module.down.register_forward_pre_hook(
-                    make_linear_hook(module.down.weight)
-                )
-            )
-    return handles
 
 
 def save_checkpoint(path: Path, model: GPT, dataset: CharDataset, args):
@@ -901,9 +827,6 @@ def train(args):
         dataset.train, dataset.val, args.block_size, args.batch_size, device
     )
     opt = build_optimizer(raw_model, args, device)
-    cov_ulmo = hidden_cov_ulmo(opt)
-    if cov_ulmo is not None:
-        register_hidden_cov_hooks(raw_model, cov_ulmo)
     conv_probe = (
         ConvergenceProbe(raw_model, opt, args)
         if args.track_convergence_stats or args.auto_step_scale_from_stats
@@ -915,8 +838,6 @@ def train(args):
             print("compile_disabled_for_convergence_stats")
             args.compile = False
     model, compile_seconds = maybe_compile(raw_model, source, args, amp_dtype, device)
-    if cov_ulmo is not None:
-        cov_ulmo.cov_accums.clear()
     if compile_seconds:
         print(f"compile_seconds {compile_seconds:.3f}")
 
@@ -1399,7 +1320,7 @@ def make_parser():
     )
     p.add_argument(
         "--hidden-ulmo",
-        choices=["streaming-svd", "svd-filter", "gram-ns"],
+        choices=["streaming-svd", "gram-ns"],
         default="gram-ns",
         help="hidden-matrix ULMO",
     )
@@ -1424,7 +1345,6 @@ def make_parser():
         default="norm-power",
         help="streaming-SVD subspace iteration path",
     )
-    p.add_argument("--filter-ridge", type=float, default=1e-3)
     p.add_argument("--spi-refresh-interval", type=int, default=100)
     p.add_argument("--spi-refresh-threshold", type=float, default=0.10)
     p.add_argument(

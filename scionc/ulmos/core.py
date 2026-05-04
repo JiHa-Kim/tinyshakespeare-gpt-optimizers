@@ -4,7 +4,6 @@ import torch
 import torch.nn as nn
 
 from scionc.compile_env import ensure_compile_env
-from scionc.ulmos.streaming_svd import HiddenSVDFilterULMO, StreamingSVDULMO
 
 _GNSGroupKey = tuple[tuple[int, ...], torch.dtype, torch.device]
 _GNSGroupItem = tuple[int, torch.Tensor, torch.Tensor, bool]
@@ -13,8 +12,6 @@ __all__ = [
     "ColNormULMO",
     "RowNormULMO",
     "GramNewtonSchulzULMO",
-    "StreamingSVDULMO",
-    "HiddenSVDFilterULMO",
     "SignULMO",
     "init_colnorm_",
     "init_rownorm_",
