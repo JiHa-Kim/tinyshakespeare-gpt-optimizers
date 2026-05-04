@@ -61,7 +61,7 @@ d_0 &= (n - 1)(m_2 m_4 - m_3^2) - m_2^3 + 2 m_2 m_3 - m_4
 
 ## Bisection for the Spectral Bound
 
-To find the optimal upper bound $\beta$, the `_moment4_beta_interval` function performs a bisection search over $t \in [0, 1]$. 
+To find the optimal upper bound $\beta$, `_moment4_upper_beta` performs a bisection search over $t \in [0, 1]$.
 
 It initializes the search interval using weaker bounds (such as the 2-moment variance bound $m_2$ and the Cauchy-Schwarz $m_4$ bounds). In each bisection step, it checks if the candidate $t$ is feasible by verifying:
 ```math
