@@ -577,20 +577,6 @@ def build_optimizer(model: GPT, args, device: torch.device):
     )
 
 
-def configure_optimizer_actions(opt, args) -> None:
-    delta_tau = count_increment(args)
-    memory_beta = halving_factor(delta_tau, args.beta_half_life, "beta_half_life")
-    for group in opt.param_groups:
-        name = group.get("name")
-        if name not in GROUP_NAMES:
-            continue
-        group.update(
-            action_group_fields(name, args, delta_tau, memory_beta),
-            memory_beta=memory_beta,
-            readout_mu=args.readout_mu,
-        )
-
-
 def hidden_cov_ulmo(opt):
     for group in opt.param_groups:
         ulmo = group.get("ulmo")
@@ -683,73 +669,11 @@ def save_eval_checkpoint(
     save_checkpoint(eval_path, model, dataset, args)
 
 
-def state_checkpoint_path(path: Path, args, step: int) -> Path:
-    if args.state_out_path:
-        return Path(args.state_out_path)
-    return path.with_name(f"{path.stem}_state_step{step:05d}{path.suffix}")
-
-
-def train_state_save_step(args, decay_start: int, decay_steps: int) -> int | None:
-    if args.save_state_at == "none":
-        return None
-    if args.save_state_at == "decay-start":
-        return decay_start if decay_steps > 0 else None
-    if args.state_save_step < 0:
-        raise ValueError("--state-save-step must be nonnegative with --save-state-at step")
-    return args.state_save_step
-
-
-def save_train_state(
-    path: Path,
-    model: GPT,
-    opt,
-    dataset: CharDataset,
-    args,
-    device: torch.device,
-    step: int,
-    total_opt_steps: int,
-    best_val: float,
-    max_val: float,
-    initial_val: float | None,
-    last_losses: dict[str, float],
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "model": model.state_dict(),
-            "model_cfg": asdict(model.cfg),
-            "optimizer": opt.state_dict(),
-            "chars": dataset.chars,
-            "args": vars(args),
-            "rng": capture_rng(device),
-            "step": step,
-            "total_opt_steps": total_opt_steps,
-            "best_val": best_val,
-            "max_val": max_val,
-            "initial_val": initial_val,
-            "last_losses": dict(last_losses),
-        },
-        path,
-    )
-
-
 def load_torch_checkpoint(path: Path, device: torch.device):
     try:
         return torch.load(path, map_location=device, weights_only=False)
     except TypeError:
         return torch.load(path, map_location=device)
-
-
-def load_train_state(path: Path, model: GPT, opt, device: torch.device) -> dict:
-    ckpt = load_torch_checkpoint(path, device)
-    model.load_state_dict(ckpt["model"])
-    opt.load_state_dict(ckpt["optimizer"])
-    cpu_rng, cuda_rng = ckpt["rng"]
-    ckpt["rng"] = (
-        cpu_rng.cpu(),
-        cuda_rng.cpu() if cuda_rng is not None and device.type == "cuda" else None,
-    )
-    return ckpt
 
 
 def load_checkpoint(path: Path, device: torch.device):
@@ -977,13 +901,6 @@ def train(args):
         dataset.train, dataset.val, args.block_size, args.batch_size, device
     )
     opt = build_optimizer(raw_model, args, device)
-    resume_ckpt = (
-        load_train_state(Path(args.resume_state), raw_model, opt, device)
-        if args.resume_state
-        else None
-    )
-    if resume_ckpt is not None:
-        configure_optimizer_actions(opt, args)
     cov_ulmo = hidden_cov_ulmo(opt)
     if cov_ulmo is not None:
         register_hidden_cov_hooks(raw_model, cov_ulmo)
@@ -998,8 +915,6 @@ def train(args):
             print("compile_disabled_for_convergence_stats")
             args.compile = False
     model, compile_seconds = maybe_compile(raw_model, source, args, amp_dtype, device)
-    if resume_ckpt is not None:
-        restore_rng(resume_ckpt["rng"], device)
     if cov_ulmo is not None:
         cov_ulmo.cov_accums.clear()
     if compile_seconds:
@@ -1060,40 +975,18 @@ def train(args):
     if line_curve_scales:
         print("line_curve_scales " + ",".join(f"{x:g}" for x in line_curve_scales))
 
-    start_step = int(resume_ckpt.get("step", 0)) if resume_ckpt is not None else 0
-    total_opt_steps = (
-        int(resume_ckpt.get("total_opt_steps", start_step))
-        if resume_ckpt is not None
-        else 0
-    )
-    best_val = (
-        float(resume_ckpt.get("best_val", float("inf")))
-        if resume_ckpt is not None
-        else float("inf")
-    )
-    max_val = (
-        float(resume_ckpt.get("max_val", float("-inf")))
-        if resume_ckpt is not None
-        else float("-inf")
-    )
-    last_losses = (
-        dict(resume_ckpt.get("last_losses", {})) if resume_ckpt is not None else {}
-    )
-    last_losses.setdefault("train", float("nan"))
-    last_losses.setdefault("val", float("nan"))
-    last_train_loss = last_losses["train"]
-    initial_val = resume_ckpt.get("initial_val") if resume_ckpt is not None else None
+    total_opt_steps = 0
+    best_val = float("inf")
+    max_val = float("-inf")
+    last_train_loss = float("nan")
+    last_val_loss = float("nan")
+    initial_val = None
     diverged = False
     diverge_reason = ""
     train_start = sync_now(device)
     step_stat_accum = {}
-    decay_start = warmup_steps + stable_steps
-    requested_state_step = train_state_save_step(args, decay_start, decay_steps)
-    saved_state_steps = set()
-    if resume_ckpt is not None:
-        print(f"resumed_state step={start_step} path={args.resume_state}")
 
-    for step in range(start_step, args.max_iters):
+    for step in range(args.max_iters):
         current_etas = apply_scheduled_etas(
             opt, step, args.max_iters, warmup_steps, decay_steps
         )
@@ -1101,7 +994,6 @@ def train(args):
 
         if step % args.eval_interval == 0 or step == args.max_iters - 1:
             train_loss = float(last_train_loss)
-            last_losses["train"] = train_loss
             val_loss, logit_stats = estimate_val_metrics(
                 model,
                 source,
@@ -1109,7 +1001,7 @@ def train(args):
                 amp_dtype,
                 args.track_logit_stats,
             )
-            last_losses["val"] = val_loss
+            last_val_loss = val_loss
             opt_stats = (
                 consume_step_stats(step_stat_accum) if args.track_step_stats else {}
             )
@@ -1274,32 +1166,6 @@ def train(args):
                 amp_dtype,
                 device,
             )
-        if (
-            not args.no_save
-            and requested_state_step is not None
-            and total_opt_steps == requested_state_step
-            and total_opt_steps not in saved_state_steps
-        ):
-            state_path = state_checkpoint_path(Path(args.out_path), args, total_opt_steps)
-            last_losses["train"] = float(last_train_loss)
-            save_train_state(
-                state_path,
-                raw_model,
-                opt,
-                dataset,
-                args,
-                device,
-                total_opt_steps,
-                total_opt_steps,
-                best_val,
-                max_val,
-                initial_val,
-                last_losses,
-            )
-            saved_state_steps.add(total_opt_steps)
-            print(f"saved_train_state step={total_opt_steps} path={state_path}")
-            if args.stop_after_state_save:
-                break
 
     if not (args.skip_sample or diverged):
         prompt = args.prompt or "\n"
@@ -1324,11 +1190,11 @@ def train(args):
                 + " ".join(f"{k}={v}" for k, v in stats.items())
             )
 
-    last_losses["train"] = float(last_train_loss)
+    last_train_loss = float(last_train_loss)
     result = {
         "best_val": best_val,
-        "final_train": last_losses["train"],
-        "final_val": last_losses["val"],
+        "final_train": last_train_loss,
+        "final_val": last_val_loss,
         "compile_seconds": compile_seconds,
         "initial_val": float("nan") if initial_val is None else initial_val,
         "max_val": max_val,
@@ -1592,39 +1458,12 @@ def make_parser():
     p.add_argument("--temperature", type=float, default=0.9)
     p.add_argument("--top-k", type=int, default=40)
     p.add_argument("--skip-sample", action="store_true")
-    p.add_argument(
-        "--resume-state",
-        default="",
-        help="resume training from a full train-state checkpoint",
-    )
     p.add_argument("--no-save", action="store_true")
     p.add_argument(
         "--save-interval",
         type=int,
         default=400,
         help="save eval checkpoints every N steps in addition to best/final",
-    )
-    p.add_argument(
-        "--save-state-at",
-        choices=["none", "decay-start", "step"],
-        default="decay-start",
-        help="save a full train-state checkpoint at a branchable schedule point",
-    )
-    p.add_argument(
-        "--state-save-step",
-        type=int,
-        default=-1,
-        help="optimizer step for --save-state-at step",
-    )
-    p.add_argument(
-        "--state-out-path",
-        default="",
-        help="optional explicit path for the full train-state checkpoint",
-    )
-    p.add_argument(
-        "--stop-after-state-save",
-        action="store_true",
-        help="stop training immediately after writing the requested train state",
     )
     p.add_argument(
         "--max-cuda-reserved-gb",
