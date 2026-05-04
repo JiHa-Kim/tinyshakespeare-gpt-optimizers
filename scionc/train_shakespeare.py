@@ -398,11 +398,7 @@ def group_action(group: dict, scheduled_step_scale: float) -> tuple[float, float
 
     ratio = group_schedule_ratio(group, scheduled_step_scale)
     peak_shrink = float(group["peak_shrink"])
-    shrink = (
-        peak_shrink
-        if group.get("shrink_schedule") == "constant"
-        else peak_shrink**ratio
-    )
+    shrink = peak_shrink**ratio
     return shrink, float(group["base_eta"]) * scheduled_step_scale
 
 
@@ -494,7 +490,6 @@ def action_group_fields(
         "min_step_scale": min_step_scale,
         "peak_shrink": peak_shrink,
         "shrink_half_life": shrink_half_life,
-        "shrink_schedule": args.shrink_schedule,
         "rms_solve": args.rms_solve,
         "beta_half_life": args.beta_half_life,
         "count_increment": delta_tau,
@@ -708,7 +703,6 @@ def format_optimizer_schedule(opt) -> str:
             f"s={peak_step_scale:.3g}->{min_step_scale:.3g},"
             f"eta={peak_eta:.3e}->{min_eta:.3e},"
             f"h_shrink={shrink_half_life:.3g},"
-            f"shrink_sched={group.get('shrink_schedule', 'scheduled')},"
             f"shrink={peak_shrink:.6f}->{min_shrink:.6f})"
         )
     return ", ".join(parts)
@@ -1355,15 +1349,6 @@ def make_parser():
     )
     for group in GROUP_NAMES:
         p.add_argument(f"--shrink-half-life-{group}", type=float, default=None)
-    p.add_argument(
-        "--shrink-schedule",
-        choices=["scheduled", "constant"],
-        default="scheduled",
-        help=(
-            "scheduled applies the WSD ratio to the shrink halving exponent; "
-            "constant keeps shrink at its peak half-life"
-        ),
-    )
     p.add_argument(
         "--rms-solve",
         action=argparse.BooleanOptionalAction,

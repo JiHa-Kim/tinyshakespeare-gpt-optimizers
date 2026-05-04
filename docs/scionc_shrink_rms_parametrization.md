@@ -46,9 +46,7 @@ and for the shrink halving exponent:
 \sigma_t=\sigma_{\mathrm{peak}}^{q_t}.
 ```
 
-This keeps one visible schedule while preserving independent coordinates. For
-ablation, `--shrink-schedule constant` keeps `sigma_t` at the peak half-life
-value and schedules only `eta_t`.
+This keeps one visible schedule while preserving independent coordinates.
 
 At the reference count increment `64 * 256`, the defaults are:
 
@@ -128,7 +126,6 @@ Primary coordinates:
 - `--log2-step-scale*` / `--step-scale*`: peak eta multiplier.
 - `--min-step-scale*`: eta schedule floor.
 - `--shrink-half-life-*`: group shrink half-lives.
-- `--shrink-schedule`: `scheduled` or `constant`.
 - `--beta-half-life`: momentum-state retention half-life.
 - `--target-rms-*`: target actual entrywise weight RMS values. Defaults are
   `embed=0.70`, `hidden=0.051`, `out=0.022`.
