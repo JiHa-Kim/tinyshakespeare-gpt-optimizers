@@ -432,11 +432,12 @@ def ulmo_atom_sq(p: torch.Tensor, ulmo) -> float:
 
 @torch.no_grad()
 def current_group_rms(group: dict) -> float:
-    total = sum(p.numel() for p in group["params"])
+    params = [p.detach().float() for p in group["params"] if p.numel()]
+    total = sum(p.numel() for p in params)
     if total <= 0:
         return 0.0
-    sq = sum(float(p.detach().float().square().sum()) for p in group["params"])
-    return math.sqrt(sq / total)
+    sq = torch.stack(torch._foreach_norm(params)).square().sum()
+    return math.sqrt(float(sq) / total)
 
 
 @torch.no_grad()
