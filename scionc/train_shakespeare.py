@@ -1371,7 +1371,7 @@ def make_parser():
     p.add_argument(
         "--track-convergence-stats",
         action="store_true",
-        help="probe Gluon smoothness and spectral-ratio stats during training",
+        help="probe smoothness and spectral-ratio stats during training",
     )
     p.add_argument(
         "--track-line-probe",
