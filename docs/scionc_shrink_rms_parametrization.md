@@ -6,11 +6,11 @@ This note documents the active optimizer coordinates used by
 - additive step-scale schedule `eta_t`,
 - primal weight shrink schedule `sigma_t`,
 - momentum-state retention schedule `beta_t`,
-- target actual entrywise RMS weight radius `R_W`.
+- target actual entrywise weight RMS `R_W`.
 
 `eta_t` controls movement. `sigma_t` controls contraction of the previous primal
-weight iterate. `R_W` is the actual weight RMS target used for initialization,
-reporting, and the capped one-step solve.
+weight iterate. `R_W` is used directly for initialization, reporting, and the
+capped one-step solve.
 
 ## Update
 
@@ -52,7 +52,7 @@ value and schedules only `eta_t`.
 
 At the reference count increment `64 * 256`, the defaults are:
 
-| group | `R_W` actual RMS | `eta_peak` | `sigma_peak` |
+| group | target RMS `R_W` | `eta_peak` | `sigma_peak` |
 |---|---:|---:|---:|
 | embed | 0.700 | 0.035 | 0.965000 |
 | hidden | 0.051 | 0.035 | 0.988333 |
@@ -103,7 +103,7 @@ H_{\mathrm{shrink}}(\tau,\Delta\tau),
 R_W(\tau).
 ```
 
-Then recompute the per-update retentions from the new count increment:
+Then recompute the per-update factors from the new count increment:
 
 ```math
 \Delta\tau
@@ -130,6 +130,6 @@ Primary coordinates:
 - `--shrink-half-life-*`: group shrink half-lives.
 - `--shrink-schedule`: `scheduled` or `constant`.
 - `--beta-half-life`: momentum-state retention half-life.
-- `--rms-radius-*`: target actual entrywise RMS radii. Defaults are
+- `--target-rms-*`: target actual entrywise weight RMS values. Defaults are
   `embed=0.70`, `hidden=0.051`, `out=0.022`.
 - `--rms-solve` / `--no-rms-solve`: toggle capped one-step RMS targeting.

@@ -8,7 +8,7 @@ def _rms_solved_group_eta(
     params: list[torch.Tensor],
     updates: list[torch.Tensor],
     shrink: float,
-    target_radius: float,
+    target_rms: float,
     lr: float,
 ) -> torch.Tensor:
     total = sum(p.numel() for p in params)
@@ -24,14 +24,14 @@ def _rms_solved_group_eta(
     s = s / total
     w_sq = w_sq / total
     v_sq = v_sq / total
-    r_sq = target_radius * target_radius
+    target_sq = target_rms * target_rms
     shrink_sq = shrink * shrink
-    d = shrink_sq * s * s - v_sq * (shrink_sq * w_sq - r_sq)
+    d = shrink_sq * s * s - v_sq * (shrink_sq * w_sq - target_sq)
 
     root = d.clamp_min(0.0).sqrt()
     eta = (-shrink * s + root) / v_sq
     alternate = (-shrink * s - root) / v_sq
-    eta = torch.where((shrink_sq * w_sq > r_sq) & (s < 0.0), alternate, eta)
+    eta = torch.where((shrink_sq * w_sq > target_sq) & (s < 0.0), alternate, eta)
     eta = torch.where(d < 0.0, -shrink * s / v_sq, eta)
     return eta.clamp(0.0, lr)
 
@@ -46,7 +46,7 @@ class ScionC(Optimizer):
         p <- shrink * p + eta * ulmo(m)
 
     The additive scale `eta` is taken from `lr` (step-scale form). If
-    `rms_solve` and `rms_radius` are set on a group, `eta` is dynamically
+    `rms_solve` and `target_rms` are set on a group, `eta` is dynamically
     solved via the one-step RMS solve and capped by `lr`.
     """
 
@@ -58,7 +58,7 @@ class ScionC(Optimizer):
         readout_mu: float = 1.0,
         ulmo=None,
         shrink: float = 1.0,
-        rms_radius: float | None = None,
+        target_rms: float | None = None,
         rms_solve: bool = False,
     ):
         if lr < 0.0:
@@ -78,7 +78,7 @@ class ScionC(Optimizer):
                 readout_mu=readout_mu,
                 ulmo=ulmo,
                 shrink=shrink,
-                rms_radius=rms_radius,
+                target_rms=target_rms,
                 rms_solve=rms_solve,
             ),
         )
@@ -95,7 +95,7 @@ class ScionC(Optimizer):
             if not entries:
                 continue
 
-            target_radius = group.get("rms_radius") if group.get("rms_solve") else None
+            target_rms = group.get("target_rms") if group.get("rms_solve") else None
             lr = float(group["lr"])
             shrink = float(group["shrink"])
             if lr == 0.0:
@@ -106,13 +106,13 @@ class ScionC(Optimizer):
 
             updates = self._updates(group["ulmo"], entries)
             params = [p for _, p, _ in entries]
-            if target_radius is None:
+            if target_rms is None:
                 if shrink != 1.0:
                     torch._foreach_mul_(params, shrink)
                 torch._foreach_add_(params, updates, alpha=lr)
             else:
                 eta = _rms_solved_group_eta(
-                    params, updates, shrink, float(target_radius), lr
+                    params, updates, shrink, float(target_rms), lr
                 )
                 if shrink != 1.0:
                     torch._foreach_mul_(params, shrink)

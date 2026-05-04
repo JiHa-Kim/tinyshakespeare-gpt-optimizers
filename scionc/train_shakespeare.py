@@ -53,12 +53,12 @@ from scionc.probes.optimizer_stats import (
     consume_step_stats,
 )
 
-DEFAULT_RMS_RADII = {
+DEFAULT_TARGET_RMS = {
     "embed": 0.70,
     "hidden": 0.051,
     "out": 0.022,
 }
-GROUP_NAMES = tuple(DEFAULT_RMS_RADII)
+GROUP_NAMES = tuple(DEFAULT_TARGET_RMS)
 DEFAULT_COUNT_INCREMENT = 64 * 256
 DEFAULT_MOMENTUM_RETENTION = 0.95
 DEFAULT_BETA_HALF_LIFE = -DEFAULT_COUNT_INCREMENT / math.log2(
@@ -297,15 +297,15 @@ def resolve_group_step_scale(args, group: str) -> tuple[float, float]:
     return peak, floor
 
 
-def resolve_group_rms_radius(args, group: str) -> float:
-    radius = getattr(args, f"rms_radius_{group}", None)
-    if radius is None:
-        radius = getattr(args, "rms_radius", None)
-    if radius is None:
-        radius = DEFAULT_RMS_RADII[group]
-    if radius <= 0.0:
-        raise ValueError(f"invalid {group} target RMS radius: {radius}")
-    return float(radius)
+def resolve_group_target_rms(args, group: str) -> float:
+    target = getattr(args, f"target_rms_{group}", None)
+    if target is None:
+        target = getattr(args, "target_rms", None)
+    if target is None:
+        target = DEFAULT_TARGET_RMS[group]
+    if target <= 0.0:
+        raise ValueError(f"invalid {group} target RMS: {target}")
+    return float(target)
 
 
 def count_increment(args) -> int:
@@ -468,11 +468,11 @@ def init_like_ulmo_(p: torch.Tensor, ulmo, radius: float) -> None:
         raise TypeError(f"unsupported ULMO init: {type(ulmo).__name__}")
 
 
-def init_radius_for_weight_rms(p: torch.Tensor, ulmo, rms_radius: float) -> float:
+def init_radius_for_target_rms(p: torch.Tensor, ulmo, target_rms: float) -> float:
     atom_sq = ulmo_atom_sq(p, ulmo)
     if atom_sq <= 0.0:
-        return rms_radius
-    return rms_radius / math.sqrt(atom_sq)
+        return target_rms
+    return target_rms / math.sqrt(atom_sq)
 
 
 @torch.no_grad()
@@ -480,7 +480,7 @@ def init_from_actions_(groups: list[dict]) -> None:
     for group in groups:
         ulmo = group["ulmo"]
         for p in group["params"]:
-            radius = init_radius_for_weight_rms(p, ulmo, float(group["rms_radius"]))
+            radius = init_radius_for_target_rms(p, ulmo, float(group["target_rms"]))
             init_like_ulmo_(p, ulmo, radius)
 
 
@@ -494,9 +494,9 @@ def action_group_fields(
         shrink_half_life,
         f"{name}_shrink_half_life",
     )
-    rms_radius = resolve_group_rms_radius(args, name)
+    target_rms = resolve_group_target_rms(args, name)
     fields = {
-        "rms_radius": rms_radius,
+        "target_rms": target_rms,
         "memory_beta": memory_beta,
         "base_eta": DEFAULT_BASE_ETA,
         "peak_eta": DEFAULT_BASE_ETA * peak_step_scale,
@@ -775,10 +775,10 @@ def format_optimizer_schedule(opt) -> str:
         min_step_scale = group.get("min_step_scale", 0.0)
         peak_shrink, peak_eta = group_action(group, peak_step_scale)
         min_shrink, min_eta = group_action(group, min_step_scale)
-        rms_radius = group.get("rms_radius", math.nan)
+        target_rms = group.get("target_rms", math.nan)
         shrink_half_life = group.get("shrink_half_life", math.inf)
         parts.append(
-            f"{name}=(rw={rms_radius:g},"
+            f"{name}=(target_rms={target_rms:g},"
             f"s={peak_step_scale:.3g}->{min_step_scale:.3g},"
             f"eta={peak_eta:.3e}->{min_eta:.3e},"
             f"h_shrink={shrink_half_life:.3g},"
@@ -792,7 +792,7 @@ def format_optimizer_schedule(opt) -> str:
 def optimizer_rms_state(opt) -> dict[str, dict[str, float]]:
     out = {}
     for group in opt.param_groups:
-        target = float(group.get("rms_radius", math.nan))
+        target = float(group.get("target_rms", math.nan))
         current = current_group_rms(group)
         out[group.get("name", f"group{len(out)}")] = {
             "param_rms": current,
@@ -1374,17 +1374,17 @@ def make_parser():
     for group in GROUP_NAMES:
         p.add_argument(f"--min-step-scale-{group}", type=float, default=None)
     p.add_argument(
-        "--rms-radius",
-        dest="rms_radius",
+        "--target-rms",
+        dest="target_rms",
         type=float,
         default=None,
         help=(
-            "peak actual entrywise weight RMS target for all optimizer groups; "
+            "actual entrywise weight RMS target for all optimizer groups; "
             "defaults are embed=0.70, hidden=0.051, out=0.022"
         ),
     )
     for group in GROUP_NAMES:
-        p.add_argument(f"--rms-radius-{group}", type=float, default=None)
+        p.add_argument(f"--target-rms-{group}", type=float, default=None)
     p.add_argument(
         "--beta-half-life",
         type=float,
@@ -1448,7 +1448,7 @@ def make_parser():
         "--rms-solve",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="solve eta per step to target rms-radius, capped by the eta schedule",
+        help="solve eta per step to target RMS, capped by the eta schedule",
     )
 
     p.add_argument("--prompt", default="To be, or not to be")

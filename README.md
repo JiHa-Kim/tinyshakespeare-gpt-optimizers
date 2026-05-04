@@ -50,7 +50,7 @@ By default, ScionC solves the nonnegative one-step `eta` that targets `R_W` at
 the end of the update, capped by the baseline `eta_t` schedule. Eval lines print
 `weight_rms current/target` for each optimizer group.
 
-See [docs/scionc_rms_radius_parametrization.md](docs/scionc_rms_radius_parametrization.md)
+See [docs/scionc_shrink_rms_parametrization.md](docs/scionc_shrink_rms_parametrization.md)
 for the derivation.
 
 ## Defaults
@@ -61,7 +61,7 @@ for the derivation.
 - batch size: 64
 - gradient accumulation: 1
 - block size: 256
-- target actual RMS radii: embedding 0.70, hidden 0.051, output 0.022
+- target actual weight RMS: embedding 0.70, hidden 0.051, output 0.022
 - peak eta: 0.035 at step scale 1 (`log2=0`)
 - RMS solve: enabled, capped by the eta schedule
 - schedule floor: 0
@@ -90,8 +90,8 @@ incoming activation covariance for hidden linear layers.
 ```bash
 uv run python -m scionc.train_shakespeare \
   --mode train \
-  --out-path out/scionc_rms_radius_2k.pt \
-  --sample-out out/scionc_rms_radius_2k_samples.md \
+  --out-path out/scionc_target_rms_2k.pt \
+  --sample-out out/scionc_target_rms_2k_samples.md \
   --prenorm rmsnorm \
   --batch-size 64 --grad-accum 1 --block-size 256 \
   --n-layer 6 --n-head 6 --d-model 384 \
@@ -112,6 +112,6 @@ Evaluate the saved checkpoint with more batches:
 uv run python -m scionc.train_shakespeare \
   --mode eval \
   --device cuda \
-  --out-path out/scionc_rms_radius_2k.pt \
+  --out-path out/scionc_target_rms_2k.pt \
   --eval-iters 200
 ```
