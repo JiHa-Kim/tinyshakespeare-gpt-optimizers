@@ -454,11 +454,6 @@ def current_group_rms(group: dict) -> float:
     return math.sqrt(sq / total)
 
 
-def configure_group_rms_targets(group: dict) -> None:
-    rms_radius = float(group["rms_radius"])
-    group["rms_targets"] = [rms_radius] * len(group["params"])
-
-
 @torch.no_grad()
 def init_like_ulmo_(p: torch.Tensor, ulmo, radius: float) -> None:
     if isinstance(ulmo, ColNormULMO):
@@ -483,10 +478,9 @@ def init_radius_for_weight_rms(p: torch.Tensor, ulmo, rms_radius: float) -> floa
 @torch.no_grad()
 def init_from_actions_(groups: list[dict]) -> None:
     for group in groups:
-        targets = group.get("rms_targets", [])
         ulmo = group["ulmo"]
-        for index, p in enumerate(group["params"]):
-            radius = init_radius_for_weight_rms(p, ulmo, float(targets[index]))
+        for p in group["params"]:
+            radius = init_radius_for_weight_rms(p, ulmo, float(group["rms_radius"]))
             init_like_ulmo_(p, ulmo, radius)
 
 
@@ -535,14 +529,12 @@ def optimizer_group(
 ) -> dict | None:
     if not params:
         return None
-    group = {
+    return {
         "name": name,
         "params": params,
         "ulmo": ulmo,
         **action_group_fields(name, args, delta_tau, memory_beta),
     }
-    configure_group_rms_targets(group)
-    return group
 
 
 def optimizer_group_specs(model: GPT, args, work_dtype: torch.dtype):
@@ -597,7 +589,6 @@ def configure_optimizer_actions(opt, args) -> None:
             memory_beta=memory_beta,
             readout_mu=args.readout_mu,
         )
-        configure_group_rms_targets(group)
 
 
 def hidden_cov_ulmo(opt):
@@ -1090,6 +1081,7 @@ def train(args):
     )
     last_losses.setdefault("train", float("nan"))
     last_losses.setdefault("val", float("nan"))
+    last_train_loss = last_losses["train"]
     initial_val = resume_ckpt.get("initial_val") if resume_ckpt is not None else None
     diverged = False
     diverge_reason = ""
@@ -1108,7 +1100,8 @@ def train(args):
         eta = current_etas.get("hidden", next(iter(current_etas.values())))
 
         if step % args.eval_interval == 0 or step == args.max_iters - 1:
-            train_loss = last_losses["train"]
+            train_loss = float(last_train_loss)
+            last_losses["train"] = train_loss
             val_loss, logit_stats = estimate_val_metrics(
                 model,
                 source,
@@ -1207,7 +1200,7 @@ def train(args):
         opt.zero_grad(set_to_none=True)
         if conv_probe is not None:
             conv_probe.start_step(step)
-        train_loss = 0.0
+        train_loss = None
         for micro_step in range(args.grad_accum):
             batch = source.get("train")
             if line_active and micro_step == 0:
@@ -1216,18 +1209,15 @@ def train(args):
             with amp_ctx(amp_dtype):
                 _, loss = model(*batch)
                 loss = loss / args.grad_accum
-            loss_value = float(loss.detach())
-            if not math.isfinite(loss_value):
-                diverged, diverge_reason = True, "nonfinite_train_loss"
-                break
+            loss_value = loss.detach()
             if line_active and micro_step == 0:
-                line_loss_before = loss_value
-            train_loss += loss_value
+                line_loss_before = float(loss_value)
+            train_loss = loss_value if train_loss is None else train_loss + loss_value
             loss.backward()
         if diverged:
             print(f"diverged {diverge_reason}")
             break
-        last_losses["train"] = train_loss
+        last_train_loss = train_loss if train_loss is not None else float("nan")
 
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(raw_model.parameters(), args.grad_clip)
@@ -1291,6 +1281,7 @@ def train(args):
             and total_opt_steps not in saved_state_steps
         ):
             state_path = state_checkpoint_path(Path(args.out_path), args, total_opt_steps)
+            last_losses["train"] = float(last_train_loss)
             save_train_state(
                 state_path,
                 raw_model,
@@ -1333,6 +1324,7 @@ def train(args):
                 + " ".join(f"{k}={v}" for k, v in stats.items())
             )
 
+    last_losses["train"] = float(last_train_loss)
     result = {
         "best_val": best_val,
         "final_train": last_losses["train"],

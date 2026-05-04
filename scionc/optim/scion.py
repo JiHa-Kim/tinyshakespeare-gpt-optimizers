@@ -1,33 +1,39 @@
-import math
-
 import torch
 from torch.optim import Optimizer
 
 __all__ = ["ScionC"]
 
 
-def _rms_solved_eta(
-    p: torch.Tensor,
-    u: torch.Tensor,
+def _rms_solved_group_eta(
+    entries: list[tuple[int, torch.Tensor, torch.Tensor]],
+    updates: list[torch.Tensor],
     shrink: float,
     target_radius: float,
     lr: float,
-) -> float:
-    s = (p * u).mean().item()
-    w_sq = p.square().mean().item()
-    v_sq = max(u.square().mean().item(), 1e-15)
+) -> torch.Tensor:
+    total = sum(p.numel() for _, p, _ in entries)
+    if total <= 0:
+        return torch.zeros((), device=updates[0].device, dtype=updates[0].dtype)
+
+    s = sum(
+        (p * u).sum(dtype=torch.float32)
+        for (_, p, _), u in zip(entries, updates, strict=True)
+    )
+    w_sq = sum(p.square().sum(dtype=torch.float32) for _, p, _ in entries)
+    v_sq = sum(u.square().sum(dtype=torch.float32) for u in updates).clamp_min(1e-15)
+    s = s / total
+    w_sq = w_sq / total
+    v_sq = v_sq / total
     r_sq = target_radius * target_radius
     shrink_sq = shrink * shrink
     d = shrink_sq * s * s - v_sq * (shrink_sq * w_sq - r_sq)
 
-    if d < 0.0:
-        return min(max(0.0, -shrink * s / v_sq), lr)
-
-    root = math.sqrt(d)
+    root = d.clamp_min(0.0).sqrt()
     eta = (-shrink * s + root) / v_sq
-    if shrink_sq * w_sq > r_sq and s < 0.0:
-        eta = (-shrink * s - root) / v_sq
-    return min(max(0.0, eta), lr)
+    alternate = (-shrink * s - root) / v_sq
+    eta = torch.where((shrink_sq * w_sq > r_sq) & (s < 0.0), alternate, eta)
+    eta = torch.where(d < 0.0, -shrink * s / v_sq, eta)
+    return eta.clamp(0.0, lr)
 
 
 class ScionC(Optimizer):
@@ -89,8 +95,7 @@ class ScionC(Optimizer):
             if not entries:
                 continue
 
-            rms_radius = group.get("rms_radius") if group.get("rms_solve") else None
-            rms_targets = group.get("rms_targets") if group.get("rms_solve") else None
+            target_radius = group.get("rms_radius") if group.get("rms_solve") else None
             lr = float(group["lr"])
             shrink = float(group["shrink"])
             if lr == 0.0:
@@ -100,22 +105,19 @@ class ScionC(Optimizer):
                 continue
 
             updates = self._updates(group["ulmo"], entries)
-            for (param_index, p, _), u in zip(entries, updates, strict=True):
-                target_radius = None
-                if rms_targets is not None:
-                    target_radius = float(rms_targets[param_index])
-                elif rms_radius is not None:
-                    target_radius = float(rms_radius)
-
-                if target_radius is not None:
-                    eta = _rms_solved_eta(p, u, shrink, target_radius, lr)
-                else:
-                    eta = lr
-
+            params = [p for _, p, _ in entries]
+            if target_radius is None:
                 if shrink != 1.0:
-                    p.mul_(shrink)
-                if eta != 0.0:
-                    p.add_(u, alpha=eta)
+                    torch._foreach_mul_(params, shrink)
+                torch._foreach_add_(params, updates, alpha=lr)
+            else:
+                eta = _rms_solved_group_eta(
+                    entries, updates, shrink, float(target_radius), lr
+                )
+                if shrink != 1.0:
+                    torch._foreach_mul_(params, shrink)
+                torch._foreach_mul_(updates, eta)
+                torch._foreach_add_(params, updates)
 
         return loss
 
